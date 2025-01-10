@@ -25,7 +25,6 @@ package web
 //
 // if the struct also implements CustomValidator then that will also be ran
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
@@ -35,15 +34,17 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/templates"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/templates"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
 	"github.com/lib/pq"
+	"github.com/volatiletech/null/v8"
+	"github.com/volatiletech/sqlboiler/v4/types"
 )
 
 type CustomValidator interface {
-	Validate(tmplData TemplateData) (ok bool)
+	Validate(tmplData TemplateData, guild int64) (ok bool)
 }
 
 type ValidationTag struct {
@@ -114,27 +115,26 @@ func ValidateForm(guild *dstate.GuildSet, tmpl TemplateData, form interface{}) b
 		// Perform validation based on value type
 		switch cv := vField.Interface().(type) {
 		case int:
-			min, max := readMinMax(validationTag)
-			err = ValidateIntMinMaxField(int64(cv), int64(min), int64(max))
+			min, max, onlyMin := readMinMax(validationTag)
+			err = ValidateIntMinMaxField(int64(cv), int64(min), int64(max), onlyMin)
 		case int64:
 			var keep bool
 			keep, err = ValidateIntField(cv, validationTag, guild, false)
 			if err == nil && !keep {
 				vField.SetInt(0)
 			}
-		case sql.NullInt64:
+		case null.Int64:
 			var keep bool
-			var newNullInt sql.NullInt64
 			keep, err = ValidateIntField(cv.Int64, validationTag, guild, false)
 			if err == nil && !keep {
-				vField.Set(reflect.ValueOf(newNullInt))
+				vField.Set(reflect.ValueOf(null.Int64{}))
 			}
 		case float64:
-			min, max := readMinMax(validationTag)
-			err = ValidateFloatField(cv, min, max)
+			min, max, onlyMin := readMinMax(validationTag)
+			err = ValidateFloatField(cv, min, max, onlyMin)
 		case float32:
-			min, max := readMinMax(validationTag)
-			err = ValidateFloatField(float64(cv), min, max)
+			min, max, onlyMin := readMinMax(validationTag)
+			err = ValidateFloatField(float64(cv), min, max, onlyMin)
 		case string:
 			var newS string
 			newS, err = ValidateStringField(cv, validationTag, guild)
@@ -171,6 +171,14 @@ func ValidateForm(guild *dstate.GuildSet, tmpl TemplateData, form interface{}) b
 			}
 
 			vField.Set(reflect.ValueOf(pq.Int64Array(newSlice)))
+		case types.Int64Array:
+			newSlice, e := ValidateIntSliceField(cv, validationTag, guild)
+			if e != nil {
+				err = e
+				break
+			}
+
+			vField.Set(reflect.ValueOf(types.Int64Array(newSlice)))
 		default:
 			// Recurse if it's another struct
 			switch tField.Type.Kind() {
@@ -210,7 +218,7 @@ func ValidateForm(guild *dstate.GuildSet, tmpl TemplateData, form interface{}) b
 	}
 
 	if validator, okc := form.(CustomValidator); okc {
-		ok2 := validator.Validate(tmpl)
+		ok2 := validator.Validate(tmpl, guild.ID)
 		if !ok2 {
 			ok = false
 		}
@@ -219,12 +227,12 @@ func ValidateForm(guild *dstate.GuildSet, tmpl TemplateData, form interface{}) b
 	return ok
 }
 
-func readMinMax(valid *ValidationTag) (float64, float64) {
+func readMinMax(valid *ValidationTag) (float64, float64, bool) {
 
 	min, _ := valid.Float(0)
 	max, _ := valid.Float(1)
 
-	return min, max
+	return min, max, valid.values[1] == "" // Last value is a flag which represents that only min value is provided
 }
 
 func ValidateIntSliceField(is []int64, tags *ValidationTag, guild *dstate.GuildSet) (filtered []int64, err error) {
@@ -248,8 +256,8 @@ func ValidateIntField(i int64, tags *ValidationTag, guild *dstate.GuildSet, forc
 
 	if kind != "role" && kind != "channel" {
 		// Treat as min max
-		min, max := readMinMax(tags)
-		return true, ValidateIntMinMaxField(i, int64(min), int64(max))
+		min, max, onlyMin := readMinMax(tags)
+		return true, ValidateIntMinMaxField(i, int64(min), int64(max), onlyMin)
 	}
 
 	if kind == "" {
@@ -284,7 +292,14 @@ func ValidateIntField(i int64, tags *ValidationTag, guild *dstate.GuildSet, forc
 
 }
 
-func ValidateIntMinMaxField(i int64, min, max int64) error {
+func ValidateIntMinMaxField(i int64, min, max int64, onlyMin bool) error {
+
+	if onlyMin {
+		if i < min {
+			return fmt.Errorf("should be at least %d", min)
+		}
+		return nil
+	}
 
 	if min != max && (i < min || i > max) {
 		return fmt.Errorf("out of range (%d - %d)", min, max)
@@ -293,7 +308,14 @@ func ValidateIntMinMaxField(i int64, min, max int64) error {
 	return nil
 }
 
-func ValidateFloatField(f float64, min, max float64) error {
+func ValidateFloatField(f float64, min, max float64, onlyMin bool) error {
+
+	if onlyMin {
+		if f < min {
+			return fmt.Errorf("should be at least %f", min)
+		}
+		return nil
+	}
 
 	if min != max && (f < min || f > max) {
 		return fmt.Errorf("out of range (%f - %f)", min, max)

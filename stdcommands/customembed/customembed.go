@@ -1,18 +1,18 @@
 package customembed
 
 import (
-	"encoding/json"
-
-	"github.com/botlabs-gg/yagpdb/commands"
-	"github.com/jonas747/dcmd/v4"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/commands"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dcmd"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/goccy/go-yaml"
 )
 
 var Command = &commands.YAGCommand{
-	CmdCategory:         commands.CategoryFun,
+	CmdCategory:         commands.CategoryTool,
 	Name:                "CustomEmbed",
 	Aliases:             []string{"ce"},
-	Description:         "Creates an embed from what you give it in json form: https://docs.yagpdb.xyz/others/custom-embeds",
+	Description:         "Creates an embed from what you give it in json form: https://help.yagpdb.xyz/docs/reference/custom-embeds/",
 	LongDescription:     "Example: `-ce {\"title\": \"hello\", \"description\": \"wew\"}`",
 	RequiredArgs:        1,
 	RequireDiscordPerms: []int64{discordgo.PermissionManageMessages},
@@ -20,11 +20,19 @@ var Command = &commands.YAGCommand{
 		{Name: "Json", Type: dcmd.String},
 	},
 	RunFunc: func(data *dcmd.Data) (interface{}, error) {
-		var parsed *discordgo.MessageEmbed
-		err := json.Unmarshal([]byte(data.Args[0].Str()), &parsed)
+		j := common.ParseCodeblock(data.Args[0].Str())
+		var parsed discordgo.MessageEmbed
+
+		// yaml.Unmarshal also works with JSON, as that is a subset of YAML.
+		err := yaml.Unmarshal([]byte(j), &parsed)
 		if err != nil {
-			return "Failed parsing json: " + err.Error(), err
+			return err, err
 		}
-		return parsed, nil
+
+		if discordgo.IsEmbedEmpty(&parsed) {
+			return "Cannot send an empty embed", nil
+		}
+
+		return &parsed, nil
 	},
 }

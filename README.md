@@ -21,7 +21,7 @@ YAGPDB is a multifunctional, modular Discord bot. It is modular in the sense tha
 
 * [Homepage](https://yagpdb.xyz)
 * [Support Server](https://discord.gg/4udtcA5)
-* [Documentation](https://docs.yagpdb.xyz)
+* [Help Center](https://help.yagpdb.xyz)
 
 ## Selfhosting
 
@@ -31,7 +31,9 @@ There are two ways of selfhosting this bot: [standalone](#Hosting-Standalone), o
 
 Directions on creating an app and getting credentials may be found
 [here](https://github.com/reactiflux/discord-irc/wiki/Creating-a-discord-bot-&-getting-a-token).
-	@@ -37,129 +36,82 @@ via the Control Panel.
+
+YAGPDB does not require you to authorize the bot: all of that will be handled
+via the Control Panel.
 
 In addition, you will need to add the following urls to the bot's "REDIRECT URI(S)" configuration:
 
@@ -72,9 +74,9 @@ docker-compose -f yagpdb/yagpdb_docker/docker-compose.dev.yml up
 
 #### Requirements
 
-* Golang 1.16 or above
+* Golang 1.20 or above
 * PostgreSQL 9.6 or later
-* Redis version 3.x or later
+* Redis version 5.x or later
 
 #### Setting Up
 

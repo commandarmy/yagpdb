@@ -1,23 +1,26 @@
 package bot
 
 import (
+	"fmt"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"emperror.dev/errors"
-	"github.com/botlabs-gg/yagpdb/bot/eventsystem"
-	"github.com/botlabs-gg/yagpdb/bot/joinedguildsupdater"
-	"github.com/botlabs-gg/yagpdb/bot/models"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/featureflags"
-	"github.com/botlabs-gg/yagpdb/common/pubsub"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/bot/eventsystem"
+	"github.com/botlabs-gg/yagpdb/v2/bot/joinedguildsupdater"
+	"github.com/botlabs-gg/yagpdb/v2/bot/models"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/featureflags"
+	"github.com/botlabs-gg/yagpdb/v2/common/pubsub"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
 	"github.com/mediocregopher/radix/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sirupsen/logrus"
-	"github.com/volatiletech/sqlboiler/boil"
+	"github.com/volatiletech/sqlboiler/v4/boil"
 )
 
 func addBotHandlers() {
@@ -49,6 +52,7 @@ func addBotHandlers() {
 	eventsystem.AddHandlerAsyncLastLegacy(BotPlugin, HandleRatelimit, eventsystem.EventRateLimit)
 	eventsystem.AddHandlerAsyncLastLegacy(BotPlugin, ReadyTracker.handleReadyOrResume, eventsystem.EventReady, eventsystem.EventResumed)
 	eventsystem.AddHandlerAsyncLastLegacy(BotPlugin, handleResumed, eventsystem.EventResumed)
+	eventsystem.AddHandlerAsyncLastLegacy(BotPlugin, HandleInteractionCreate, eventsystem.EventInteractionCreate)
 }
 
 var (
@@ -312,6 +316,53 @@ func HandleReactionAdd(evt *eventsystem.EventData) {
 	}
 }
 
+func handleDmGuildInfoInteraction(evt *eventsystem.EventData) {
+	ic := evt.InteractionCreate()
+	customID := ic.MessageComponentData().CustomID
+	guild_id, err := strconv.ParseInt(strings.Replace(customID, "DM_", "", 1), 10, 64)
+	if err != nil {
+		logger.Errorf("DM interaction received with incorrect customID: %s from user %d", customID, ic.User.ID)
+	}
+	gs, err := evt.Session.Guild(guild_id)
+	logger.WithError(err).Errorf("Failed getting guild info for DM %s from user %d", customID, ic.User.ID)
+	response := discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{Flags: 64},
+	}
+	content := ""
+	if gs == nil {
+		content = fmt.Sprintf("This DM was sent from server\nID: **%d**, \nI couldn't fetch more information about it.", guild_id)
+	} else {
+		content = fmt.Sprintf("This DM was sent from server\nID: **%d**, \nName: **%s**", guild_id, gs.Name)
+	}
+	response.Data.Content = content
+	err = evt.Session.CreateInteractionResponse(ic.ID, ic.Token, &response)
+	logger.WithError(err).Printf("Interaction Response!")
+}
+
+func HandleInteractionCreate(evt *eventsystem.EventData) {
+	ic := evt.InteractionCreate()
+	if ic.GuildID != 0 {
+		return
+	}
+	if ic.User == nil {
+		return
+	}
+	if ic.User.ID == common.BotUser.ID {
+		return
+	}
+	//handle dm message guild info interaction
+
+	if ic.Type == discordgo.InteractionMessageComponent && strings.HasPrefix(ic.MessageComponentData().CustomID, "DM_") {
+		handleDmGuildInfoInteraction(evt)
+	} else {
+		err := pubsub.Publish("dm_interaction", -1, ic)
+		if err != nil {
+			logger.WithError(err).Error("failed publishing dm interaction")
+		}
+	}
+}
+
 func HandleMessageCreate(evt *eventsystem.EventData) {
 	commonEventsTotal.With(prometheus.Labels{"type": "Message Create"}).Inc()
 
@@ -339,7 +390,7 @@ func HandleMessageCreateUpdateFirst(evt *eventsystem.EventData) {
 
 	if evt.Type == eventsystem.EventMessageCreate {
 		msg := evt.MessageCreate()
-		if !IsNormalUserMessage(msg.Message) {
+		if !IsUserMessage(msg.Message) {
 			return
 		}
 
@@ -350,10 +401,9 @@ func HandleMessageCreateUpdateFirst(evt *eventsystem.EventData) {
 
 	} else {
 		edit := evt.MessageUpdate()
-		if !IsNormalUserMessage(edit.Message) {
+		if !IsUserMessage(edit.Message) {
 			return
 		}
-
 		edit.Member.User = edit.Author
 		edit.Member.GuildID = edit.GuildID
 	}

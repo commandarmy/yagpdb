@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/botlabs-gg/yagpdb/antiphishing"
-	"github.com/botlabs-gg/yagpdb/bot"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/safebrowsing"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
+	"github.com/botlabs-gg/yagpdb/v2/antiphishing"
+	"github.com/botlabs-gg/yagpdb/v2/bot"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
+	"github.com/botlabs-gg/yagpdb/v2/safebrowsing"
 	"github.com/mediocregopher/radix/v3"
 )
 
@@ -78,7 +78,9 @@ func (r BaseRule) PushViolation(key string) (p Punishment, err error) {
 		return
 	}
 
-	common.RedisPool.Do(radix.FlatCmd(nil, "EXPIRE", key, r.ViolationsExpire))
+	if r.ViolationsExpire > 0 {
+		common.RedisPool.Do(radix.FlatCmd(nil, "EXPIRE", key, r.ViolationsExpire*60))
+	}
 
 	mute := r.MuteAfter > 0 && violations >= r.MuteAfter
 	kick := r.KickAfter > 0 && violations >= r.KickAfter
@@ -120,8 +122,8 @@ func (r BaseRule) ShouldIgnore(cs *dstate.ChannelState, evt *discordgo.Message, 
 type SpamRule struct {
 	BaseRule `valid:"traverse"`
 
-	NumMessages int `valid:"0,1000"`
-	Within      int `valid:"0,100"`
+	NumMessages int `valid:"1,1000"`
+	Within      int `valid:"1,100"`
 }
 
 // Triggers when a certain number of messages is found by the same author within a timeframe
@@ -143,6 +145,9 @@ func (s *SpamRule) Check(evt *discordgo.Message, cs *dstate.ChannelState) (del b
 }
 
 func (s *SpamRule) FindSpam(evt *discordgo.Message, cs *dstate.ChannelState) bool {
+	if s.Within == 0 {
+		s.Within = 1
+	}
 	within := time.Duration(s.Within) * time.Second
 	now := time.Now()
 
@@ -162,8 +167,11 @@ func (s *SpamRule) FindSpam(evt *discordgo.Message, cs *dstate.ChannelState) boo
 			amount++
 		}
 	}
+	if s.NumMessages < 1 {
+		s.NumMessages = 1
+	}
 
-	return amount >= s.NumMessages && s.NumMessages != 1
+	return amount > s.NumMessages
 }
 
 type InviteRule struct {
@@ -171,7 +179,7 @@ type InviteRule struct {
 }
 
 func (i *InviteRule) Check(evt *discordgo.Message, cs *dstate.ChannelState) (del bool, punishment Punishment, msg string, err error) {
-	if !CheckMessageForBadInvites(evt.ContentWithMentionsReplaced(), cs.GuildID) {
+	if !CheckMessageForBadInvites(evt) {
 		return
 	}
 
@@ -186,170 +194,169 @@ func (i *InviteRule) Check(evt *discordgo.Message, cs *dstate.ChannelState) (del
 	return
 }
 
-type CachedInvite struct {
-	CreatedAt time.Time
-	Invite    string // we only store the invite code, no need to waste memory on the entire invite data
+type GuildInvites struct {
+	createdAt time.Time
+	invites   map[string]bool
 }
 
-var InvitesCache = struct {
+type cachedGuildInvites struct {
 	sync.RWMutex
+	guilds map[int64]GuildInvites
+}
 
-	CacheMap map[int64][]CachedInvite
-}{CacheMap: make(map[int64][]CachedInvite)}
+func (c *cachedGuildInvites) gc(d time.Duration) {
+	ticker := time.NewTicker(d)
+	for range ticker.C {
+		c.tick(d)
+	}
+}
 
-func CheckMessageForBadInvites(msg string, guildID int64) (containsBadInvites bool) {
-	// check third party sites
-	if common.ContainsInvite(msg, false, true) != nil {
-		return true
+func (c *cachedGuildInvites) tick(d time.Duration) {
+	logger.Info("Starting invites cache GC")
+
+	t1 := time.Now()
+	var counter int
+
+	invitesCache.Lock()
+	for guild := range c.guilds {
+		if time.Since(c.guilds[guild].createdAt) > d {
+			delete(c.guilds, guild)
+			counter++
+		}
 	}
 
-	matches := common.DiscordInviteSource.Regex.FindAllStringSubmatch(msg, -1)
-	if len(matches) < 1 {
-		return false
-	}
+	invitesCache.Unlock()
+	logger.Infof("Finished clearing invites cache in %v. %d guilds removed.", time.Since(t1), counter)
+}
 
-	// Only check each invite id once
-	checked := make([]string, 0, len(matches))
+func (c *cachedGuildInvites) get(guildId int64) (GuildInvites, bool) {
+	c.RLock()
+	defer c.RUnlock()
+	guildInvite, ok := c.guilds[guildId]
+	return guildInvite, ok
+}
 
-OUTER:
-	for _, v := range matches {
-		if len(v) < 3 {
+func (c *cachedGuildInvites) set(guildID int64, invites map[string]bool) {
+	c.Lock()
+	defer c.Unlock()
+	c.guilds[guildID] = GuildInvites{time.Now(), invites}
+}
+
+var invitesCache cachedGuildInvites
+
+func init() {
+	invitesCache = cachedGuildInvites{guilds: make(map[int64]GuildInvites)}
+	go invitesCache.gc(invitesCacheDuration * time.Minute)
+}
+
+// invitesCacheDuration is the period between ticks for the invitesCache gc in minutes
+const invitesCacheDuration = 60
+
+func CheckMessageForBadInvites(msg *discordgo.Message) (containsBadInvites bool) {
+	guildID := msg.GuildID
+	for _, content := range msg.GetMessageContents() {
+		// check third party sites
+		if common.ContainsInvite(content, false, true) != nil {
+			return true
+		}
+
+		matches := common.DiscordInviteSource.Regex.FindAllStringSubmatch(content, -1)
+		if len(matches) < 1 {
 			continue
 		}
 
-		id := v[2]
+		guildInvites, ok := invitesCache.get(guildID)
+		if !ok { // we do not have a cache for this guild yet, create it
+			invites, err := common.BotSession.GuildInvites(guildID)
+			if err != nil {
+				logger.WithError(err).WithField("guild", guildID).Error("Failed fetching invites", invites)
+				return true // assume bad since discord...
+			}
 
-		// only check each link once
-		for _, c := range checked {
-			if id == c {
-				continue OUTER
+			// if there are no invites for this guild
+			// assume it is a bad invite.
+			if len(invites) == 0 {
+				return true
+			}
+
+			// add invites to the cache
+			inviteMap := make(map[string]bool)
+			for _, invite := range invites {
+				inviteMap[invite.Code] = true
+			}
+			guild := bot.State.GetGuild(guildID)
+			if guild != nil && len(guild.VanityURLCode) > 0 {
+				inviteMap[guild.VanityURLCode] = true
+			}
+
+			invitesCache.set(guildID, inviteMap)
+
+			// overwrite the empty invite map
+			// with the one just returned by discord
+			guildInvites = GuildInvites{
+				invites: inviteMap,
 			}
 		}
 
-		checked = append(checked, id)
+		// Only check each invite id once,
+		// in case it repeats in the message multiple times.
+		checked := make(map[string]bool, len(matches))
 
-		InvitesCache.RLock()
-		if len(InvitesCache.CacheMap) == 0 {
-			go inviteCacheGC()
-		}
-
-		for guild, cache := range InvitesCache.CacheMap {
-			for _, cachedInvite := range cache {
-				if cachedInvite.Invite == id {
-					InvitesCache.RUnlock()
-					if guild == guildID {
-						// Ignore invites to this server
-						continue OUTER
-					}
-					// If the invite is present on our cache, we return true even if it is not valid anymore
-					// This is to prevent making API Calls about invites which have a restrict rate limit
-					// Because otherwise we would most likely hit those limits
-					return true
-				}
+		for _, v := range matches {
+			if len(v) < 3 {
+				continue
 			}
-		}
-		InvitesCache.RUnlock()
 
-		// Check to see if its a valid id, and if so check if its to the same server were on
-		invite, err := common.BotSession.Invite(id)
-		if err != nil {
-			logger.WithError(err).WithField("guild", guildID).Error("Failed checking invite ", invite)
-			return true // assume bad since discord...
-		}
-
-		if invite == nil || invite.Guild == nil {
-			continue
-		}
-
-		InvitesCache.RLock()
-		var found bool
-		for _, cached := range InvitesCache.CacheMap[invite.Guild.ID] {
-			if cached.Invite == invite.Code {
-				found = true
-				break
+			id := v[2]
+			// only check each link once
+			if checked[id] {
+				continue
+			} else {
+				checked[id] = true
 			}
-		}
-		InvitesCache.RUnlock()
 
-		if !found {
-			InvitesCache.Lock()
-			// This invite was not found on our cache, so let's add it
-			InvitesCache.CacheMap[invite.Guild.ID] = append(InvitesCache.CacheMap[invite.Guild.ID], CachedInvite{
-				CreatedAt: time.Now(),
-				Invite:    invite.Code,
-			})
-			InvitesCache.Unlock()
-		}
+			// Safe guard the map look up using the invite mutex.
+			// This is a extremely rare, but possible race condition.
+			invitesCache.RLock()
+			isInviteOk := guildInvites.invites[id]
+			invitesCache.RUnlock()
 
-		// Ignore invites to this server
-		if invite.Guild.ID == guildID {
-			continue
-		}
+			if isInviteOk {
+				// ignore invites to this guild
+				continue
+			}
 
-		return true
+			// invite to another guild found
+			//
+			// PS: we were getting a lot of rate
+			// limits issues from discord by
+			// validating each individual invite.
+			//
+			// Thus, we now return true for
+			// all possible invites, even if
+			// the invite is not valid.
+			//
+			// Reason being it is much easier
+			// to get an actual invite than
+			// just a fake one.
+			return true
+		}
 	}
 
-	// If we got here then there's no bad invites
+	// If we got here then there are no bad invites
 	return false
-}
-
-// Ticker duration for the InvitesCacheGC in minutes
-const InvitesCacheDuration = 60
-
-func inviteCacheGC() {
-	// Called right now, so we can sleep before starting
-	time.Sleep((InvitesCacheDuration * time.Minute) + (10 * time.Second))
-
-	ticker := time.NewTicker(InvitesCacheDuration * time.Minute)
-	for {
-		logger.Info("Starting invites cache GC")
-
-		start := time.Now()
-		var counter int
-
-		InvitesCache.Lock()
-
-		for guild, cache := range InvitesCache.CacheMap {
-			for i, cached := range cache {
-				if time.Since(cached.CreatedAt) > (InvitesCacheDuration * time.Minute) {
-					InvitesCache.CacheMap[guild] = removeFromSlice(cache, i)
-					counter++
-				}
-			}
-
-			if len(InvitesCache.CacheMap[guild]) == 0 {
-				// there are no more cached invites for this guild, so we can delete the entry
-				delete(InvitesCache.CacheMap, guild)
-			}
-		}
-
-		if len(InvitesCache.CacheMap) == 0 {
-			InvitesCache.Unlock()
-			// there are no more cached invites, so we can break the loop
-			logger.Info("No more invites cached. Breaking the Invite's GC loop now")
-			break
-		}
-
-		InvitesCache.Unlock()
-
-		logger.Infof("Finished clearing invites cache in %v. %d invites removed.", time.Since(start), counter)
-
-		<-ticker.C
-	}
-}
-
-func removeFromSlice(s []CachedInvite, i int) []CachedInvite {
-	s[i] = s[len(s)-1]
-	return s[:len(s)-1]
 }
 
 type MentionRule struct {
 	BaseRule `valid:"traverse"`
 
-	Treshold int `valid:"0,500"`
+	Treshold int `valid:"1,500"`
 }
 
 func (m *MentionRule) Check(evt *discordgo.Message, cs *dstate.ChannelState) (del bool, punishment Punishment, msg string, err error) {
+	if m.Treshold == 0 {
+		m.Treshold = 1
+	}
 	if len(evt.Mentions) < m.Treshold {
 		return
 	}
@@ -468,7 +475,7 @@ func (w *SitesRule) GetCompiled() []string {
 }
 
 func (s *SitesRule) Check(evt *discordgo.Message, cs *dstate.ChannelState) (del bool, punishment Punishment, msg string, err error) {
-	banned, item, threatList := s.checkMessage(forwardSlashReplacer.Replace(evt.Content))
+	banned, item, threatList := s.checkMessage(evt)
 	if !banned {
 		return
 	}
@@ -484,43 +491,45 @@ func (s *SitesRule) Check(evt *discordgo.Message, cs *dstate.ChannelState) (del 
 	return
 }
 
-func (s *SitesRule) checkMessage(message string) (banned bool, item string, threatList string) {
-	matches := common.LinkRegex.FindAllString(message, -1)
+func (s *SitesRule) checkMessage(message *discordgo.Message) (banned bool, item string, threatList string) {
+	for _, content := range message.GetMessageContents() {
+		matches := common.LinkRegex.FindAllString(common.ForwardSlashReplacer.Replace(content), -1)
+		for _, v := range matches {
 
-	for _, v := range matches {
+			if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") && !strings.HasPrefix(v, "steam://") {
+				v = "http://" + v
+			}
 
-		if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") && !strings.HasPrefix(v, "steam://") {
-			v = "http://" + v
+			parsed, err := url.ParseRequestURI(v)
+			if err != nil {
+				logger.WithError(err).WithField("url", v).Error("Failed parsing request url matched with regex")
+			} else {
+				if banned, item := s.isBanned(parsed.Host); banned {
+					return true, item, ""
+				}
+			}
 		}
 
-		parsed, err := url.ParseRequestURI(v)
-		if err != nil {
-			logger.WithError(err).WithField("url", v).Error("Failed parsing request url matched with regex")
-		} else {
-			if banned, item := s.isBanned(parsed.Host); banned {
-				return true, item, ""
+		if s.ScamLinkProtection {
+			scamLink, err := antiphishing.CheckMessageForPhishingDomains(common.ForwardSlashReplacer.Replace(content))
+			if err != nil {
+				logger.WithError(err).Error("Failed checking urls against antiphishing APIs")
+			} else if scamLink != "" {
+				return true, scamLink, ""
+			}
+		}
+
+		// Check safebrowsing
+		if s.GoogleSafeBrowsingEnabled {
+			threat, err := safebrowsing.CheckString(common.ForwardSlashReplacer.Replace(content))
+			if err != nil {
+				logger.WithError(err).Error("Failed checking urls against google safebrowser")
+			} else if threat != nil {
+				return true, threat.Pattern, threat.ThreatType.String()
 			}
 		}
 	}
 
-	if s.ScamLinkProtection {
-		scamLink, err := antiphishing.CheckMessageForPhishingDomains(message)
-		if err != nil {
-			logger.WithError(err).Error("Failed checking urls against antiphishing APIs")
-		} else if scamLink != "" {
-			return true, scamLink, ""
-		}
-	}
-
-	// Check safebrowsing
-	if s.GoogleSafeBrowsingEnabled {
-		threat, err := safebrowsing.CheckString(message)
-		if err != nil {
-			logger.WithError(err).Error("Failed checking urls against google safebrowser")
-		} else if threat != nil {
-			return true, threat.Pattern, threat.ThreatType.String()
-		}
-	}
 	return false, "", ""
 }
 

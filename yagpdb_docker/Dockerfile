@@ -1,4 +1,4 @@
-FROM golang:stretch as builder
+FROM docker.io/golang:1.23.3 AS builder
 
 WORKDIR /appbuild/yagpdb
 COPY go.mod go.sum ./
@@ -7,11 +7,11 @@ RUN go mod download
 COPY . .
 
 WORKDIR /appbuild/yagpdb/cmd/yagpdb
-RUN CGO_ENABLED=0 GOOS=linux go build -v -ldflags "-X github.com/botlabs-gg/yagpdb/common.VERSION=$(git describe --tags)"
+RUN CGO_ENABLED=0 GOOS=linux go build -v -ldflags "-X github.com/botlabs-gg/yagpdb/v2/common.VERSION=$(git describe --tags)"
 
 
 
-FROM alpine:latest
+FROM docker.io/alpine:latest
 
 WORKDIR /app
 VOLUME ["/app/soundboard", "/app/cert"]

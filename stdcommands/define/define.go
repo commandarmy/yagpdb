@@ -6,20 +6,21 @@ import (
 	"net/url"
 	"regexp"
 
-	"github.com/botlabs-gg/yagpdb/bot/paginatedmessages"
-	"github.com/botlabs-gg/yagpdb/commands"
-	"github.com/botlabs-gg/yagpdb/common"
+	"github.com/botlabs-gg/yagpdb/v2/bot/paginatedmessages"
+	"github.com/botlabs-gg/yagpdb/v2/commands"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dcmd"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
 	"github.com/dpatrie/urbandictionary"
-	"github.com/jonas747/dcmd/v4"
-	"github.com/jonas747/discordgo/v2"
 )
 
 var Command = &commands.YAGCommand{
-	CmdCategory:  commands.CategoryFun,
-	Name:         "Define",
-	Aliases:      []string{"df"},
-	Description:  "Look up an urban dictionary definition, default paginated view.",
-	RequiredArgs: 1,
+	CmdCategory:         commands.CategoryFun,
+	Name:                "Define",
+	Aliases:             []string{"df", "define", "urban", "urbandictionary"},
+	Description:         "Look up an urban dictionary definition, default paginated view.",
+	RequiredArgs:        1,
+	SlashCommandEnabled: false,
 	Arguments: []*dcmd.ArgDef{
 		{Name: "Topic", Type: dcmd.String},
 	},
@@ -44,27 +45,20 @@ var Command = &commands.YAGCommand{
 		}
 
 		if paginatedView {
-			_, err := paginatedmessages.CreatePaginatedMessage(
-				data.GuildData.GS.ID, data.ChannelID, 1, len(qResp.Results), func(p *paginatedmessages.PaginatedMessage, page int) (*discordgo.MessageEmbed, error) {
-					i := page - 1
+			return paginatedmessages.NewPaginatedResponse(data.GuildData.GS.ID, data.ChannelID, 1, len(qResp.Results), func(p *paginatedmessages.PaginatedMessage, page int) (*discordgo.MessageEmbed, error) {
+				i := page - 1
 
-					paginatedEmbed := embedCreator(qResp.Results, i)
-					return paginatedEmbed, nil
-				})
-			if err != nil {
-				return "Something went wrong", nil
-			}
-		} else {
-			result := qResp.Results[0]
-
-			cmdResp := fmt.Sprintf("**%s**: %s\n*%s*\n*(<%s>)*", result.Word, result.Definition, result.Example, result.Permalink)
-			if len(qResp.Results) > 1 {
-				cmdResp += fmt.Sprintf(" *%d more results*", len(qResp.Results)-1)
-			}
-			return cmdResp, nil
+				paginatedEmbed := embedCreator(qResp.Results, i)
+				return paginatedEmbed, nil
+			}), nil
 		}
 
-		return nil, nil
+		result := qResp.Results[0]
+		cmdResp := fmt.Sprintf("**%s**: %s\n*%s*\n*(<%s>)*", result.Word, result.Definition, result.Example, result.Permalink)
+		if len(qResp.Results) > 1 {
+			cmdResp += fmt.Sprintf(" *%d more results*", len(qResp.Results)-1)
+		}
+		return cmdResp, nil
 	},
 }
 
@@ -73,10 +67,17 @@ func embedCreator(udResult []urbandictionary.Result, i int) *discordgo.MessageEm
 	if len(definition) > 2000 {
 		definition = common.CutStringShort(definition, 2000) + "\n\n(definition too long)"
 	}
+
 	example := "None given"
 	if len(udResult[i].Example) > 0 {
 		example = linkReferencedTerms(udResult[i].Example)
 	}
+
+	author := "Unknown"
+	if len(udResult[i].Author) > 0 {
+		author = udResult[i].Author
+	}
+
 	embed := &discordgo.MessageEmbed{
 		Author: &discordgo.MessageEmbedAuthor{
 			Name: udResult[i].Word,
@@ -85,9 +86,9 @@ func embedCreator(udResult []urbandictionary.Result, i int) *discordgo.MessageEm
 		Description: fmt.Sprintf("**Definition**: %s", linkReferencedTerms(definition)),
 		Color:       int(rand.Int63n(16777215)),
 		Fields: []*discordgo.MessageEmbedField{
-			&discordgo.MessageEmbedField{Name: "Example:", Value: example},
-			&discordgo.MessageEmbedField{Name: "Author:", Value: udResult[i].Author},
-			&discordgo.MessageEmbedField{Name: "Votes:", Value: fmt.Sprintf("Upvotes: %d\nDownvotes: %d", udResult[i].Upvote, udResult[i].Downvote)},
+			{Name: "Example:", Value: example},
+			{Name: "Author:", Value: author},
+			{Name: "Votes:", Value: fmt.Sprintf("Upvotes: %d\nDownvotes: %d", udResult[i].Upvote, udResult[i].Downvote)},
 		},
 		Thumbnail: &discordgo.MessageEmbedThumbnail{
 			URL: "https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/UD_logo-01.svg/512px-UD_logo-01.svg.png",

@@ -11,12 +11,12 @@ import (
 	"time"
 
 	"emperror.dev/errors"
-	"github.com/botlabs-gg/yagpdb/bot"
-	"github.com/botlabs-gg/yagpdb/commands"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/premium/models"
-	"github.com/botlabs-gg/yagpdb/stdcommands/util"
-	"github.com/jonas747/dcmd/v4"
+	"github.com/botlabs-gg/yagpdb/v2/bot"
+	"github.com/botlabs-gg/yagpdb/v2/commands"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dcmd"
+	"github.com/botlabs-gg/yagpdb/v2/premium/models"
+	"github.com/botlabs-gg/yagpdb/v2/stdcommands/util"
 	"github.com/lib/pq"
 	"github.com/volatiletech/null/v8"
 	"github.com/volatiletech/sqlboiler/v4/boil"
@@ -34,9 +34,7 @@ func init() {
 
 type CodePremiumSource struct{}
 
-func (ps *CodePremiumSource) Init() {
-}
-
+func (ps *CodePremiumSource) Init() {}
 func (ps *CodePremiumSource) Names() (human string, idname string) {
 	return "Redeemed code", "code"
 }
@@ -55,7 +53,7 @@ func RedeemCode(ctx context.Context, code string, userID int64) error {
 	}
 
 	// model found, with no user attached, create the slot for it
-	slot, err := CreatePremiumSlot(ctx, tx, userID, "code", "Redeemed code", c.Message, c.ID, time.Duration(c.Duration), PremiumTierPremium)
+	slot, err := CreatePremiumSlot(ctx, tx, userID, PremiumSourceTypeCode, "Redeemed code", c.Message, c.ID, time.Duration(c.Duration), PremiumTierPremium)
 	if err != nil {
 		tx.Rollback()
 		return errors.WithMessage(err, "CreatePremiumSlot")
@@ -155,7 +153,7 @@ var cmdGenerateCode = &commands.YAGCommand{
 	HideFromCommandsPage: true,
 	Name:                 "generatepremiumcode",
 	Aliases:              []string{"gpc"},
-	Description:          "Generates premium codes",
+	Description:          "Generates premium codes. Bot Owner Only",
 	HideFromHelp:         true,
 	RequiredArgs:         3,
 	RunInDM:              true,

@@ -11,18 +11,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/botlabs-gg/yagpdb/bot"
-	"github.com/botlabs-gg/yagpdb/bot/botrest"
-	"github.com/botlabs-gg/yagpdb/commands"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/backgroundworkers"
-	"github.com/botlabs-gg/yagpdb/common/config"
-	"github.com/botlabs-gg/yagpdb/common/configstore"
-	"github.com/botlabs-gg/yagpdb/common/mqueue"
-	"github.com/botlabs-gg/yagpdb/common/pubsub"
-	"github.com/botlabs-gg/yagpdb/common/sentryhook"
-	"github.com/botlabs-gg/yagpdb/feeds"
-	"github.com/botlabs-gg/yagpdb/web"
+	"github.com/botlabs-gg/yagpdb/v2/bot"
+	"github.com/botlabs-gg/yagpdb/v2/bot/botrest"
+	"github.com/botlabs-gg/yagpdb/v2/commands"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/backgroundworkers"
+	"github.com/botlabs-gg/yagpdb/v2/common/config"
+	"github.com/botlabs-gg/yagpdb/v2/common/mqueue"
+	"github.com/botlabs-gg/yagpdb/v2/common/pubsub"
+	"github.com/botlabs-gg/yagpdb/v2/common/sentryhook"
+	"github.com/botlabs-gg/yagpdb/v2/feeds"
+	"github.com/botlabs-gg/yagpdb/v2/web"
 	"github.com/getsentry/sentry-go"
 	log "github.com/sirupsen/logrus"
 )
@@ -39,7 +38,7 @@ var (
 	flagLogTimestamp bool
 
 	flagSysLog        bool
-	flagGenCmdDocs    bool
+	FlagGenCmdDocs    bool
 	flagGenConfigDocs bool
 
 	flagLogAppName string
@@ -60,7 +59,7 @@ func init() {
 	flag.BoolVar(&flagSysLog, "syslog", false, "Set to log to syslog (only linux)")
 	flag.StringVar(&flagLogAppName, "logappname", "yagpdb", "When using syslog, the application name will be set to this")
 	flag.BoolVar(&flagRunBWC, "backgroundworkers", false, "Run the various background workers, atleast one process needs this")
-	flag.BoolVar(&flagGenCmdDocs, "gencmddocs", false, "Generate command docs and exit")
+	flag.BoolVar(&FlagGenCmdDocs, "gencmddocs", false, "Generate command docs and exit")
 	flag.BoolVar(&flagGenConfigDocs, "genconfigdocs", false, "Generate config docs and exit")
 
 	flag.BoolVar(&flagLogTimestamp, "ts", false, "Set to include timestamps in log")
@@ -114,9 +113,6 @@ func Init() {
 		log.WithError(err).Fatal("Failed intializing")
 	}
 
-	log.Info("Initiliazing generic config store")
-	configstore.InitDatabases()
-
 	log.Info("Starting plugins")
 }
 
@@ -139,7 +135,7 @@ func Run() {
 
 	commands.InitCommands()
 
-	if flagGenCmdDocs {
+	if FlagGenCmdDocs {
 		GenCommandsDocs()
 		return
 	}

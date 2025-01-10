@@ -4,15 +4,18 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"time"
 
 	"emperror.dev/errors"
-	"github.com/botlabs-gg/yagpdb/analytics"
-	"github.com/botlabs-gg/yagpdb/bot"
-	"github.com/botlabs-gg/yagpdb/bot/eventsystem"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/templates"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
+	"github.com/botlabs-gg/yagpdb/v2/analytics"
+	"github.com/botlabs-gg/yagpdb/v2/bot"
+	"github.com/botlabs-gg/yagpdb/v2/bot/eventsystem"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/pubsub"
+	"github.com/botlabs-gg/yagpdb/v2/common/templates"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
+	"github.com/karlseguin/ccache"
 )
 
 var _ bot.BotInitHandler = (*Plugin)(nil)
@@ -21,12 +24,36 @@ func (p *Plugin) BotInit() {
 	eventsystem.AddHandlerAsyncLast(p, HandleGuildMemberAdd, eventsystem.EventGuildMemberAdd)
 	eventsystem.AddHandlerAsyncLast(p, HandleGuildMemberRemove, eventsystem.EventGuildMemberRemove)
 	eventsystem.AddHandlerFirst(p, HandleChannelUpdate, eventsystem.EventChannelUpdate)
+
+	pubsub.AddHandler("invalidate_notifications_config_cache", handleInvalidateConfigCache, nil)
+}
+
+var configCache = ccache.New(ccache.Configure().MaxSize(15000))
+
+func BotCachedGetConfig(guildID int64) (*Config, error) {
+	const cacheDuration = 10 * time.Minute
+
+	item, err := configCache.Fetch(cacheKey(guildID), cacheDuration, func() (interface{}, error) {
+		return FetchConfig(guildID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return item.Value().(*Config), nil
+}
+
+func handleInvalidateConfigCache(evt *pubsub.Event) {
+	configCache.Delete(cacheKey(evt.TargetGuildInt))
+}
+
+func cacheKey(guildID int64) string {
+	return discordgo.StrID(guildID)
 }
 
 func HandleGuildMemberAdd(evtData *eventsystem.EventData) (retry bool, err error) {
 	evt := evtData.GuildMemberAdd()
 
-	config, err := GetConfig(evt.GuildID)
+	config, err := BotCachedGetConfig(evt.GuildID)
 	if err != nil {
 		return true, errors.WithStackIf(err)
 	}
@@ -62,14 +89,14 @@ func HandleGuildMemberAdd(evtData *eventsystem.EventData) (retry bool, err error
 
 			go analytics.RecordActiveUnit(gs.ID, &Plugin{}, "posted_join_server_msg")
 
-			if sendTemplate(gs, thinCState, config.JoinDMMsg, ms, "join dm", false, true) {
+			if sendTemplate(gs, thinCState, config.JoinDMMsg, ms, "join dm", false, templates.ExecutedFromJoin) {
 				return true, nil
 			}
 		}
 	}
 
 	if config.JoinServerEnabled && len(config.JoinServerMsgs) > 0 {
-		channel := gs.GetChannel(config.JoinServerChannelInt())
+		channel := gs.GetChannel(config.JoinServerChannel)
 		if channel == nil {
 			return
 		}
@@ -77,7 +104,7 @@ func HandleGuildMemberAdd(evtData *eventsystem.EventData) (retry bool, err error
 		go analytics.RecordActiveUnit(gs.ID, &Plugin{}, "posted_join_server_dm")
 
 		chanMsg := config.JoinServerMsgs[rand.Intn(len(config.JoinServerMsgs))]
-		if sendTemplate(gs, channel, chanMsg, ms, "join server msg", config.CensorInvites, true) {
+		if sendTemplate(gs, channel, chanMsg, ms, "join server msg", config.CensorInvites, templates.ExecutedFromJoin) {
 			return true, nil
 		}
 	}
@@ -88,7 +115,7 @@ func HandleGuildMemberAdd(evtData *eventsystem.EventData) (retry bool, err error
 func HandleGuildMemberRemove(evt *eventsystem.EventData) (retry bool, err error) {
 	memberRemove := evt.GuildMemberRemove()
 
-	config, err := GetConfig(memberRemove.GuildID)
+	config, err := BotCachedGetConfig(memberRemove.GuildID)
 	if err != nil {
 		return true, errors.WithStackIf(err)
 	}
@@ -102,7 +129,7 @@ func HandleGuildMemberRemove(evt *eventsystem.EventData) (retry bool, err error)
 		return
 	}
 
-	channel := gs.GetChannel(config.LeaveChannelInt())
+	channel := gs.GetChannel(config.LeaveChannel)
 	if channel == nil {
 		return
 	}
@@ -113,7 +140,7 @@ func HandleGuildMemberRemove(evt *eventsystem.EventData) (retry bool, err error)
 
 	go analytics.RecordActiveUnit(gs.ID, &Plugin{}, "posted_leave_server_msg")
 
-	if sendTemplate(gs, channel, chanMsg, ms, "leave", config.CensorInvites, false) {
+	if sendTemplate(gs, channel, chanMsg, ms, "leave", config.CensorInvites, templates.ExecutedFromLeave) {
 		return true, nil
 	}
 
@@ -121,10 +148,10 @@ func HandleGuildMemberRemove(evt *eventsystem.EventData) (retry bool, err error)
 }
 
 // sendTemplate parses and executes the provided template, returns wether an error occured that we can retry from (temporary network failures and the like)
-func sendTemplate(gs *dstate.GuildSet, cs *dstate.ChannelState, tmpl string, ms *dstate.MemberState, name string, censorInvites bool, enableSendDM bool) bool {
+func sendTemplate(gs *dstate.GuildSet, cs *dstate.ChannelState, tmpl string, ms *dstate.MemberState, name string, censorInvites bool, executedFrom templates.ExecutedFromType) bool {
 	ctx := templates.NewContext(gs, cs, ms)
 	ctx.CurrentFrame.SendResponseInDM = cs.Type == discordgo.ChannelTypeDM
-	ctx.IsExecedByLeaveMessage = !enableSendDM
+	ctx.ExecutedFrom = executedFrom
 
 	// since were changing the fields, we need a copy
 	msCop := *ms
@@ -141,7 +168,7 @@ func sendTemplate(gs *dstate.GuildSet, cs *dstate.ChannelState, tmpl string, ms 
 
 	// Disable sendDM if needed
 	disableFuncs := []string{}
-	if !enableSendDM {
+	if executedFrom == templates.ExecutedFromLeave {
 		disableFuncs = []string{"sendDM"}
 	}
 	ctx.DisabledContextFuncs = disableFuncs
@@ -157,17 +184,45 @@ func sendTemplate(gs *dstate.GuildSet, cs *dstate.ChannelState, tmpl string, ms 
 		return false
 	}
 
+	var m *discordgo.Message
 	if cs.Type == discordgo.ChannelTypeDM {
-		msg = "DM sent from server **" + gs.Name + "** (ID: " + discordgo.StrID(gs.ID) + ")\n" + msg
-		_, err = common.BotSession.ChannelMessageSend(cs.ID, msg)
-	} else if !ctx.CurrentFrame.DelResponse {
-		send := ctx.MessageSend("")
-		bot.QueueMergedMessage(cs.ID, msg, send.AllowedMentions)
+		msgSend := ctx.MessageSend(msg)
+		msgSend.Components = []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    "Show Server Info",
+						Style:    discordgo.PrimaryButton,
+						Emoji:    &discordgo.ComponentEmoji{Name: "📬"},
+						CustomID: fmt.Sprintf("DM_%d", gs.ID),
+					},
+				},
+			},
+		}
+		m, err = common.BotSession.ChannelMessageSendComplex(cs.ID, msgSend)
 	} else {
-		var m *discordgo.Message
-		m, err = common.BotSession.ChannelMessageSendComplex(cs.ID, ctx.MessageSend(msg))
-		if err == nil && ctx.CurrentFrame.DelResponse {
-			templates.MaybeScheduledDeleteMessage(gs.ID, cs.ID, m.ID, ctx.CurrentFrame.DelResponseDelay)
+		if len(ctx.CurrentFrame.AddResponseReactionNames) > 0 || ctx.CurrentFrame.DelResponse || ctx.CurrentFrame.PublishResponse {
+			m, err = common.BotSession.ChannelMessageSendComplex(cs.ID, ctx.MessageSend(msg))
+			if err == nil && ctx.CurrentFrame.DelResponse {
+				templates.MaybeScheduledDeleteMessage(gs.ID, cs.ID, m.ID, ctx.CurrentFrame.DelResponseDelay, "")
+			}
+		} else {
+			send := ctx.MessageSend("")
+			bot.QueueMergedMessage(cs.ID, msg, send.AllowedMentions)
+		}
+	}
+
+	if err == nil && m != nil {
+		if len(ctx.CurrentFrame.AddResponseReactionNames) > 0 {
+			go func(frame *templates.ContextFrame) {
+				for _, v := range frame.AddResponseReactionNames {
+					common.BotSession.MessageReactionAdd(m.ChannelID, m.ID, v)
+				}
+			}(ctx.CurrentFrame)
+		}
+
+		if ctx.CurrentFrame.PublishResponse && ctx.CurrentFrame.CS.Type == discordgo.ChannelTypeGuildNews {
+			common.BotSession.ChannelMessageCrosspost(m.ChannelID, m.ID)
 		}
 	}
 
@@ -202,7 +257,7 @@ func HandleChannelUpdate(evt *eventsystem.EventData) (retry bool, err error) {
 		return
 	}
 
-	config, err := GetConfig(cu.GuildID)
+	config, err := BotCachedGetConfig(cu.GuildID)
 	if err != nil {
 		return true, errors.WithStackIf(err)
 	}
@@ -212,8 +267,8 @@ func HandleChannelUpdate(evt *eventsystem.EventData) (retry bool, err error) {
 	}
 
 	topicChannel := cu.Channel.ID
-	if config.TopicChannelInt() != 0 {
-		c := gs.GetChannel(config.TopicChannelInt())
+	if config.TopicChannel != 0 {
+		c := gs.GetChannel(config.TopicChannel)
 		if c != nil {
 			topicChannel = c.ID
 		}
@@ -222,7 +277,7 @@ func HandleChannelUpdate(evt *eventsystem.EventData) (retry bool, err error) {
 	go analytics.RecordActiveUnit(cu.GuildID, &Plugin{}, "posted_topic_change")
 
 	go func() {
-		_, err := common.BotSession.ChannelMessageSend(topicChannel, fmt.Sprintf("Topic in channel <#%d> changed to **%s**", cu.ID, cu.Topic))
+		_, err := common.BotSession.ChannelMessageSend(topicChannel, fmt.Sprintf("Topic in channel <#%d> changed to \x60\x60\x60\n%s\x60\x60\x60", cu.ID, cu.Topic))
 		if err != nil {
 			logger.WithError(err).WithField("guild", cu.GuildID).Warn("Failed sending topic change message")
 		}

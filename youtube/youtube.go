@@ -3,30 +3,34 @@ package youtube
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"sync"
-	"time"
 
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/config"
-	"github.com/botlabs-gg/yagpdb/common/mqueue"
-	"github.com/botlabs-gg/yagpdb/premium"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/config"
+	"github.com/botlabs-gg/yagpdb/v2/common/mqueue"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/premium"
+	"github.com/botlabs-gg/yagpdb/v2/youtube/models"
 	"google.golang.org/api/youtube/v3"
 )
 
-const (
-	RedisChannelsLockKey = "youtube_subbed_channel_lock"
+//go:generate sqlboiler --no-hooks psql
 
-	RedisKeyWebSubChannels = "youtube_registered_websub_channels"
-	GoogleWebsubHub        = "https://pubsubhubbub.appspot.com/subscribe"
+const (
+	RedisChannelsLockKey       = "youtube_subbed_channel_lock"
+	RedisKeyPublishedVideoList = "youtube_published_videos"
+	RedisKeyWebSubChannels     = "youtube_registered_websub_channels"
+	GoogleWebsubHub            = "https://pubsubhubbub.appspot.com/subscribe"
 )
 
 var (
-	confWebsubVerifytoken = config.RegisterOption("yagpdb.youtube.verify_token", "Youtube websub push verify token, set it to a random string and never change it", "asdkpoasdkpaoksdpako")
-
-	logger = common.GetPluginLogger(&Plugin{})
+	confWebsubVerifytoken     = config.RegisterOption("yagpdb.youtube.verify_token", "Youtube websub push verify token, set it to a random string and never change it", "asdkpoasdkpaoksdpako")
+	confResubBatchSize        = config.RegisterOption("yagpdb.youtube.resub_batch_size", "Number of Websubs to resubscribe to concurrently", 1)
+	confYoutubeVideoCacheDays = config.RegisterOption("yagpdb.youtube.video_cache_duration", "Duration in days to cache youtube video data", 1)
+	logger                    = common.GetPluginLogger(&Plugin{})
 )
 
 func KeyLastVidTime(channel string) string { return "youtube_last_video_time:" + channel }
@@ -48,8 +52,6 @@ func (p *Plugin) PluginInfo() *common.PluginInfo {
 func RegisterPlugin() {
 	p := &Plugin{}
 
-	common.GORM.AutoMigrate(ChannelSubscription{}, YoutubePlaylistID{})
-
 	mqueue.RegisterSource("youtube", p)
 
 	err := p.SetupClient()
@@ -58,82 +60,68 @@ func RegisterPlugin() {
 		return
 	}
 	common.RegisterPlugin(p)
-}
 
-type ChannelSubscription struct {
-	common.SmallModel
-	GuildID            string
-	ChannelID          string
-	YoutubeChannelID   string
-	YoutubeChannelName string
-	MentionEveryone    bool
-}
-
-func (c *ChannelSubscription) TableName() string {
-	return "youtube_channel_subscriptions"
-}
-
-type YoutubePlaylistID struct {
-	ChannelID  string `gorm:"primary_key"`
-	CreatedAt  time.Time
-	PlaylistID string
+	common.InitSchemas("youtube", DBSchemas...)
 }
 
 var _ mqueue.PluginWithSourceDisabler = (*Plugin)(nil)
 
 // Remove feeds if they don't point to a proper channel
 func (p *Plugin) DisableFeed(elem *mqueue.QueuedElement, err error) {
-	// Remove it
-	err = common.GORM.Where("channel_id = ?", elem.ChannelID).Delete(ChannelSubscription{}).Error
+	p.DisableChannelFeeds(elem.ChannelID)
+}
+
+func (p *Plugin) DisableChannelFeeds(channelID int64) error {
+	numDisabled, err := models.YoutubeChannelSubscriptions(
+		models.YoutubeChannelSubscriptionWhere.ChannelID.EQ(discordgo.StrID(channelID)),
+	).UpdateAllG(context.Background(), models.M{"enabled": false})
 	if err != nil {
-		logger.WithError(err).Error("failed removing nonexistant channel")
-	} else {
-		logger.WithField("channel", elem.ChannelID).Info("Removed youtube feed to nonexistant channel")
+		logger.WithError(err).WithField("channel", channelID).Error("failed removing feeds in nonexistent channel")
+		return err
 	}
+
+	logger.WithField("channel", channelID).Infof("disabled %d feeds in nonexistent channel", numDisabled)
+	return nil
+}
+
+func (p *Plugin) DisableGuildFeeds(guildID int64) error {
+	numDisabled, err := models.YoutubeChannelSubscriptions(
+		models.YoutubeChannelSubscriptionWhere.GuildID.EQ(discordgo.StrID(guildID)),
+	).UpdateAllG(context.Background(), models.M{"enabled": false})
+	if err != nil {
+		logger.WithError(err).WithField("guild", guildID).Error("failed removing feeds in nonexistent guild")
+		return err
+	}
+
+	logger.WithField("guild", guildID).Infof("disabled %d feeds in nonexistent guild", numDisabled)
+	return nil
 }
 
 func (p *Plugin) WebSubSubscribe(ytChannelID string) error {
-	// hub.callback:https://testing.yagpdb.xyz/yt_new_upload
-	// hub.topic:https://www.youtube.com/xml/feeds/videos.xml?channel_id=UCt-ERbX-2yA6cAqfdKOlUwQ
-	// hub.verify:sync
-	// hub.mode:subscribe
-	// hub.verify_token:hmmmmmmmmwhatsthis
-	// hub.secret:
-	// hub.lease_seconds:
-
 	values := url.Values{
 		"hub.callback":     {"https://" + common.ConfHost.GetString() + "/yt_new_upload/" + confWebsubVerifytoken.GetString()},
 		"hub.topic":        {"https://www.youtube.com/xml/feeds/videos.xml?channel_id=" + ytChannelID},
 		"hub.verify":       {"sync"},
 		"hub.mode":         {"subscribe"},
 		"hub.verify_token": {confWebsubVerifytoken.GetString()},
-		// "hub.lease_seconds": {"60"},
 	}
 
 	resp, err := http.PostForm(GoogleWebsubHub, values)
 	if err != nil {
+		logger.WithError(err).Errorf("Failed to subscribe to youtube channel with id %s", ytChannelID)
 		return err
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("Go bad status code: %d (%s) %s", resp.StatusCode, resp.Status, string(body))
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bad status code: %d (%s) %s", resp.StatusCode, resp.Status, string(body))
 	}
 
 	logger.Info("Websub: Subscribed to channel ", ytChannelID)
-
 	return nil
 }
 
 func (p *Plugin) WebSubUnsubscribe(ytChannelID string) error {
-	// hub.callback:https://testing.yagpdb.xyz/yt_new_upload
-	// hub.topic:https://www.youtube.com/xml/feeds/videos.xml?channel_id=UCt-ERbX-2yA6cAqfdKOlUwQ
-	// hub.verify:sync
-	// hub.mode:subscribe
-	// hub.verify_token:hmmmmmmmmwhatsthis
-	// hub.secret:
-	// hub.lease_seconds:
-
 	values := url.Values{
 		"hub.callback":     {"https://" + common.ConfHost.GetString() + "/yt_new_upload/" + confWebsubVerifytoken.GetString()},
 		"hub.topic":        {"https://www.youtube.com/xml/feeds/videos.xml?channel_id=" + ytChannelID},
@@ -148,11 +136,10 @@ func (p *Plugin) WebSubUnsubscribe(ytChannelID string) error {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("Go bad status code: %d (%s)", resp.StatusCode, resp.Status)
+		return fmt.Errorf("bad status code: %d (%s)", resp.StatusCode, resp.Status)
 	}
 
-	logger.Info("Websub: UnSubscribed to channel ", ytChannelID)
-
+	logger.Info("Websub: Unsubscribed from channel ", ytChannelID)
 	return nil
 }
 
@@ -183,14 +170,14 @@ type LinkEntry struct {
 }
 
 const (
-	GuildMaxFeeds        = 50
-	GuildMaxFeedsPremium = 250
+	GuildMaxFeeds               = 300
+	GuildMaxEnabledFeeds        = 10
+	GuildMaxEnabledFeedsPremium = 250
 )
 
-func MaxFeedsForContext(ctx context.Context) int {
+func MaxFeedsEnabledForContext(ctx context.Context) int {
 	if premium.ContextPremium(ctx) {
-		return GuildMaxFeedsPremium
+		return GuildMaxEnabledFeedsPremium
 	}
-
-	return GuildMaxFeeds
+	return GuildMaxEnabledFeeds
 }

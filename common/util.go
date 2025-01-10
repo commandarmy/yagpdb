@@ -3,28 +3,33 @@ package common
 import (
 	"bytes"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"math/rand"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"emperror.dev/errors"
-	"github.com/jonas747/dcmd/v4"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dcmd"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
 	"github.com/lib/pq"
 	"github.com/mediocregopher/radix/v3"
+	"github.com/microcosm-cc/bluemonday"
 	"github.com/sirupsen/logrus"
 )
 
 func KeyGuild(guildID int64) string         { return "guild:" + discordgo.StrID(guildID) }
 func KeyGuildChannels(guildID int64) string { return "channels:" + discordgo.StrID(guildID) }
 
-var LinkRegex = regexp.MustCompile(`([a-zA-Z\d]+://)?((\w+:\w+@)?([a-zA-Z\d.-]+\.[A-Za-z]{2,64})(:\d+)?(/.*)?)`)
-var DomainFinderRegex = regexp.MustCompile(`(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]`)
+var LinkRegex = regexp.MustCompile(`(?i)([a-z\d]+://)([\w-._~:/?#\[\]@!$&'()*+,;%=]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])`)
+var DomainFinderRegex = regexp.MustCompile(`(?i)(?:[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?\.)+[a-z\d][a-z\d-]{0,61}[a-z\d]`)
+var UGCHtmlPolicy = bluemonday.NewPolicy().AllowElements("h1", "h2", "h3", "h4", "h5", "h6", "p", "ol", "ul", "li", "dl", "dd", "dt", "blockquote", "table", "thead", "th", "tr", "td", "tbody", "del", "i", "b")
+var ForwardSlashReplacer = strings.NewReplacer("\\", "")
 
 type GuildWithConnected struct {
 	*discordgo.UserGuild
@@ -84,6 +89,10 @@ func RandomNoun() string {
 	return Nouns[rand.Intn(len(Nouns))]
 }
 
+func RandomVerb() string {
+	return Verbs[rand.Intn(len(Verbs))]
+}
+
 type DurationFormatPrecision int
 
 const (
@@ -122,7 +131,13 @@ func (d DurationFormatPrecision) FromSeconds(in int64) int64 {
 	case DurationPrecisionHours:
 		return ((in / 60) / 60) % 24
 	case DurationPrecisionDays:
-		return (((in / 60) / 60) / 24) % 7
+		days := (((in / 60) / 60) / 24)
+		// 365 % 7 == 1, meaning calculating days based on remainder after dividing
+		// into weeks for a year would leave us with 1 extra day. This wouldn't be
+		// a problem if we stopped at weeks, since 365 days == 52 weeks and 1 day,
+		// however the weeks mod out to 0 so that 365 days properly becomes a year.
+		// 52 weeks ≠ 1 year. Resultingly, we need to skip every 365th day.
+		return (days - days/365) % 7
 	case DurationPrecisionWeeks:
 		// There's 52 weeks + 1 day per year (techically +1.25... but were doing +1)
 		// Make sure 364 days isnt 0 weeks and 0 years
@@ -227,12 +242,6 @@ func CutStringShort(s string, l int) string {
 	return mainBuf.String() + latestBuf.String()
 }
 
-type SmallModel struct {
-	ID        uint `gorm:"primary_key"`
-	CreatedAt time.Time
-	UpdatedAt time.Time
-}
-
 func MustParseInt(s string) int64 {
 	i, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
@@ -287,7 +296,7 @@ func RemoveRoleDS(ms *dstate.MemberState, role int64) error {
 }
 
 var StringPerms = map[int64]string{
-	discordgo.PermissionReadMessages:       "Read Messages",
+	discordgo.PermissionViewChannel:        "View Channel",
 	discordgo.PermissionSendMessages:       "Send Messages",
 	discordgo.PermissionSendTTSMessages:    "Send TTS Messages",
 	discordgo.PermissionManageMessages:     "Manage Messages",
@@ -307,8 +316,9 @@ var StringPerms = map[int64]string{
 	discordgo.PermissionBanMembers:          "Ban Members",
 	discordgo.PermissionManageRoles:         "Manage Roles",
 	discordgo.PermissionManageChannels:      "Manage Channels",
-	discordgo.PermissionManageServer:        "Manage Server",
+	discordgo.PermissionManageGuild:         "Manage Guild",
 	discordgo.PermissionManageWebhooks:      "Manage Webhooks",
+	discordgo.PermissionModerateMembers:     "Moderate Members / Timeout Members",
 }
 
 func ErrWithCaller(err error) error {
@@ -345,118 +355,22 @@ func IsDiscordErr(err error, codes ...int) bool {
 	return false
 }
 
-type LoggedExecutedCommand struct {
-	SmallModel
-
-	UserID    string
-	ChannelID string
-	GuildID   string
-
-	// Name of command that was triggered
-	Command string
-	// Raw command with arguments passed
-	RawCommand string
-	// If command returned any error this will be no-empty
-	Error string
-
-	TimeStamp    time.Time
-	ResponseTime int64
-}
-
-func (l LoggedExecutedCommand) TableName() string {
-	return "executed_commands"
+// for backward compatibility with previous implementations of HumanizePermissions
+var legacyPermNames = map[int64]string{
+	discordgo.PermissionManageGuild:  "ManageServer",
+	discordgo.PermissionViewChannel:  "ReadMessages",
+	discordgo.PermissionViewAuditLog: "ViewAuditLogs",
 }
 
 func HumanizePermissions(perms int64) (res []string) {
-	if perms&discordgo.PermissionAdministrator == discordgo.PermissionAdministrator {
-		res = append(res, "Administrator")
-	}
-	if perms&discordgo.PermissionManageServer == discordgo.PermissionManageServer {
-		res = append(res, "ManageServer")
-	}
-
-	if perms&discordgo.PermissionReadMessages == discordgo.PermissionReadMessages {
-		res = append(res, "ReadMessages")
-	}
-	if perms&discordgo.PermissionSendMessages == discordgo.PermissionSendMessages {
-		res = append(res, "SendMessages")
-	}
-	if perms&discordgo.PermissionSendTTSMessages == discordgo.PermissionSendTTSMessages {
-		res = append(res, "SendTTSMessages")
-	}
-	if perms&discordgo.PermissionManageMessages == discordgo.PermissionManageMessages {
-		res = append(res, "ManageMessages")
-	}
-	if perms&discordgo.PermissionEmbedLinks == discordgo.PermissionEmbedLinks {
-		res = append(res, "EmbedLinks")
-	}
-	if perms&discordgo.PermissionAttachFiles == discordgo.PermissionAttachFiles {
-		res = append(res, "AttachFiles")
-	}
-	if perms&discordgo.PermissionReadMessageHistory == discordgo.PermissionReadMessageHistory {
-		res = append(res, "ReadMessageHistory")
-	}
-	if perms&discordgo.PermissionMentionEveryone == discordgo.PermissionMentionEveryone {
-		res = append(res, "MentionEveryone")
-	}
-	if perms&discordgo.PermissionUseExternalEmojis == discordgo.PermissionUseExternalEmojis {
-		res = append(res, "UseExternalEmojis")
-	}
-
-	// Constants for the different bit offsets of voice permissions
-	if perms&discordgo.PermissionVoiceConnect == discordgo.PermissionVoiceConnect {
-		res = append(res, "VoiceConnect")
-	}
-	if perms&discordgo.PermissionVoiceSpeak == discordgo.PermissionVoiceSpeak {
-		res = append(res, "VoiceSpeak")
-	}
-	if perms&discordgo.PermissionVoiceMuteMembers == discordgo.PermissionVoiceMuteMembers {
-		res = append(res, "VoiceMuteMembers")
-	}
-	if perms&discordgo.PermissionVoiceDeafenMembers == discordgo.PermissionVoiceDeafenMembers {
-		res = append(res, "VoiceDeafenMembers")
-	}
-	if perms&discordgo.PermissionVoiceMoveMembers == discordgo.PermissionVoiceMoveMembers {
-		res = append(res, "VoiceMoveMembers")
-	}
-	if perms&discordgo.PermissionVoiceUseVAD == discordgo.PermissionVoiceUseVAD {
-		res = append(res, "VoiceUseVAD")
-	}
-
-	// Constants for general management.
-	if perms&discordgo.PermissionChangeNickname == discordgo.PermissionChangeNickname {
-		res = append(res, "ChangeNickname")
-	}
-	if perms&discordgo.PermissionManageNicknames == discordgo.PermissionManageNicknames {
-		res = append(res, "ManageNicknames")
-	}
-	if perms&discordgo.PermissionManageRoles == discordgo.PermissionManageRoles {
-		res = append(res, "ManageRoles")
-	}
-	if perms&discordgo.PermissionManageWebhooks == discordgo.PermissionManageWebhooks {
-		res = append(res, "ManageWebhooks")
-	}
-	if perms&discordgo.PermissionManageEmojis == discordgo.PermissionManageEmojis {
-		res = append(res, "ManageEmojis")
-	}
-
-	if perms&discordgo.PermissionCreateInstantInvite == discordgo.PermissionCreateInstantInvite {
-		res = append(res, "CreateInstantInvite")
-	}
-	if perms&discordgo.PermissionKickMembers == discordgo.PermissionKickMembers {
-		res = append(res, "KickMembers")
-	}
-	if perms&discordgo.PermissionBanMembers == discordgo.PermissionBanMembers {
-		res = append(res, "BanMembers")
-	}
-	if perms&discordgo.PermissionManageChannels == discordgo.PermissionManageChannels {
-		res = append(res, "ManageChannels")
-	}
-	if perms&discordgo.PermissionAddReactions == discordgo.PermissionAddReactions {
-		res = append(res, "AddReactions")
-	}
-	if perms&discordgo.PermissionViewAuditLogs == discordgo.PermissionViewAuditLogs {
-		res = append(res, "ViewAuditLogs")
+	for _, p := range discordgo.AllPermissions {
+		if perms&p == p {
+			if legacyName, ok := legacyPermNames[p]; ok {
+				res = append(res, legacyName)
+			} else {
+				res = append(res, discordgo.PermissionName(p))
+			}
+		}
 	}
 
 	return
@@ -586,4 +500,54 @@ func SplitSendMessage(channelID int64, contents string, allowedMentions discordg
 	}
 
 	return result, nil
+}
+
+func FormatList(list []string, conjunction string) string {
+	var sb strings.Builder
+	for i, item := range list {
+		if i > 0 {
+			sb.WriteString(", ")
+			if i == len(list)-1 {
+				sb.WriteString(conjunction)
+				if conjunction != "" {
+					sb.WriteByte(' ')
+				}
+			}
+		}
+		sb.WriteByte('`')
+		sb.WriteString(item)
+		sb.WriteByte('`')
+	}
+	return sb.String()
+}
+
+func BoolToPointer(b bool) *bool {
+	return &b
+}
+
+// Also accepts spaces due to how dcmd reconstructs arguments wrapped in triple backticks.
+var codeblockRegexp = regexp.MustCompile(`(?m)\A(?:\x60{2} ?\x60)(?:.*\n)?([\S\s]+)(?:\x60 ?\x60{2})\z`)
+
+// parseCodeblock returns the content wrapped in a Discord markdown block.
+// If no (valid) codeblock was found, the given input is returned back.
+func ParseCodeblock(input string) string {
+	parts := codeblockRegexp.FindStringSubmatch(input)
+
+	// No match found, input was not wrapped in (valid) codeblock markdown
+	// just dump it, don't bother fixing things for the user.
+	if parts == nil {
+		return input
+	}
+
+	logger.Debugf("Found matches: %#v", parts)
+	logger.Debugf("Returning %s", parts[1])
+	return parts[1]
+}
+
+func Base64DecodeToString(str string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(str)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
