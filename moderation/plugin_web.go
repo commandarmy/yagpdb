@@ -6,10 +6,11 @@ import (
 	"html/template"
 	"net/http"
 
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/cplogs"
-	"github.com/botlabs-gg/yagpdb/web"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/cplogs"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/moderation/models"
+	"github.com/botlabs-gg/yagpdb/v2/web"
 	"goji.io"
 	"goji.io/pat"
 )
@@ -25,7 +26,7 @@ var (
 func (p *Plugin) InitWeb() {
 	web.AddHTMLTemplate("moderation/assets/moderation.html", PageHTML)
 
-	web.AddSidebarItem(web.SidebarCategoryTools, &web.SidebarItem{
+	web.AddSidebarItem(web.SidebarCategoryModeration, &web.SidebarItem{
 		Name: "Moderation",
 		URL:  "moderation",
 		Icon: "fas fa-gavel",
@@ -36,7 +37,7 @@ func (p *Plugin) InitWeb() {
 	web.CPMux.Handle(pat.New("/moderation/*"), subMux)
 
 	subMux.Use(web.RequireBotMemberMW) // need the bot's role
-	subMux.Use(web.RequirePermMW(discordgo.PermissionManageRoles, discordgo.PermissionKickMembers, discordgo.PermissionBanMembers, discordgo.PermissionManageMessages, discordgo.PermissionEmbedLinks))
+	subMux.Use(web.RequirePermMW(discordgo.PermissionManageRoles, discordgo.PermissionKickMembers, discordgo.PermissionBanMembers, discordgo.PermissionManageMessages, discordgo.PermissionEmbedLinks, discordgo.PermissionModerateMembers))
 
 	getHandler := web.ControllerHandler(HandleModeration, "cp_moderation")
 	postHandler := web.ControllerPostHandler(HandlePostModeration, getHandler, Config{})
@@ -54,9 +55,10 @@ func HandleModeration(w http.ResponseWriter, r *http.Request) (web.TemplateData,
 	activeGuild, templateData := web.GetBaseCPContextData(r.Context())
 
 	templateData["DefaultDMMessage"] = DefaultDMMessage
+	templateData["DefaultTimeoutDuration"] = int(DefaultTimeoutDuration.Minutes())
 
 	if _, ok := templateData["ModConfig"]; !ok {
-		config, err := GetConfig(activeGuild.ID)
+		config, err := FetchConfig(activeGuild.ID)
 		if err != nil {
 			return templateData, err
 		}
@@ -66,18 +68,17 @@ func HandleModeration(w http.ResponseWriter, r *http.Request) (web.TemplateData,
 	return templateData, nil
 }
 
-// HandlePostModeration update the settings
+// HandlePostModeration updates the settings
 func HandlePostModeration(w http.ResponseWriter, r *http.Request) (web.TemplateData, error) {
 	ctx := r.Context()
 	activeGuild, templateData := web.GetBaseCPContextData(ctx)
 	templateData["VisibleURL"] = "/manage/" + discordgo.StrID(activeGuild.ID) + "/moderation/"
 
 	newConfig := ctx.Value(common.ContextKeyParsedForm).(*Config)
-	newConfig.DefaultMuteDuration.Valid = true
-	newConfig.DefaultBanDeleteDays.Valid = true
 	templateData["ModConfig"] = newConfig
 
-	err := newConfig.Save(activeGuild.ID)
+	newConfig.GuildID = activeGuild.ID
+	err := SaveConfig(newConfig)
 
 	templateData["DefaultDMMessage"] = DefaultDMMessage
 
@@ -94,12 +95,12 @@ func HandleClearServerWarnings(w http.ResponseWriter, r *http.Request) (web.Temp
 	activeGuild, templateData := web.GetBaseCPContextData(ctx)
 	templateData["VisibleURL"] = "/manage/" + discordgo.StrID(activeGuild.ID) + "/moderation/"
 
-	rows := common.GORM.Where("guild_id = ?", activeGuild.ID).Delete(WarningModel{}).RowsAffected
-	templateData.AddAlerts(web.SucessAlert("Deleted ", rows, " warnings!"))
+	numDeleted, _ := models.ModerationWarnings(models.ModerationWarningWhere.GuildID.EQ(activeGuild.ID)).DeleteAllG(r.Context())
+	templateData.AddAlerts(web.SucessAlert("Deleted ", numDeleted, " warnings!"))
 	templateData["DefaultDMMessage"] = DefaultDMMessage
 
-	if rows > 0 {
-		go cplogs.RetryAddEntry(web.NewLogEntryFromContext(r.Context(), panelLogKeyClearWarnings, &cplogs.Param{Type: cplogs.ParamTypeInt, Value: rows}))
+	if numDeleted > 0 {
+		go cplogs.RetryAddEntry(web.NewLogEntryFromContext(r.Context(), panelLogKeyClearWarnings, &cplogs.Param{Type: cplogs.ParamTypeInt, Value: numDeleted}))
 	}
 
 	return templateData, nil
@@ -113,7 +114,7 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 	templateData["WidgetTitle"] = "Moderation"
 	templateData["SettingsPath"] = "/moderation"
 
-	config, err := GetConfig(activeGuild.ID)
+	config, err := FetchConfig(activeGuild.ID)
 	if err != nil {
 		return templateData, err
 	}
@@ -125,11 +126,12 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 	<li>Kick command: %s</li>
 	<li>Ban command: %s</li>
 	<li>Mute/Unmute commands: %s</li>
+	<li>Timeout/Untimeout commands: %s</li>
 	<li>Warning commands: %s</li>
 </ul>`
 
-	if config.ReportEnabled || config.CleanEnabled || config.GiveRoleCmdEnabled || config.ActionChannel != "" ||
-		config.MuteEnabled || config.KickEnabled || config.BanEnabled || config.WarnCommandsEnabled {
+	if config.ReportEnabled || config.CleanEnabled || config.GiveRoleCmdEnabled || config.ActionChannel != 0 ||
+		config.MuteEnabled || config.KickEnabled || config.BanEnabled || config.WarnCommandsEnabled || config.TimeoutEnabled {
 		templateData["WidgetEnabled"] = true
 	} else {
 		templateData["WidgetDisabled"] = true
@@ -138,7 +140,8 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 	templateData["WidgetBody"] = template.HTML(fmt.Sprintf(format, web.EnabledDisabledSpanStatus(config.ReportEnabled),
 		web.EnabledDisabledSpanStatus(config.CleanEnabled), web.EnabledDisabledSpanStatus(config.GiveRoleCmdEnabled),
 		web.EnabledDisabledSpanStatus(config.KickEnabled), web.EnabledDisabledSpanStatus(config.BanEnabled),
-		web.EnabledDisabledSpanStatus(config.MuteEnabled), web.EnabledDisabledSpanStatus(config.WarnCommandsEnabled)))
+		web.EnabledDisabledSpanStatus(config.MuteEnabled), web.EnabledDisabledSpanStatus(config.TimeoutEnabled),
+		web.EnabledDisabledSpanStatus(config.WarnCommandsEnabled)))
 
 	return templateData, nil
 }

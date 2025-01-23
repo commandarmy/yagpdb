@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"emperror.dev/errors"
-	"github.com/botlabs-gg/yagpdb/bot"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/bot"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
 )
 
 // dictionary creates a map[string]interface{} from the given parameters by
@@ -111,6 +111,68 @@ func StringKeyDictionary(values ...interface{}) (SDict, error) {
 	return SDict(dict), nil
 }
 
+// StringKeyValueSlices parses given input of key-value pairs but returns the
+// keys and the values as separate slices. this is used when you need to have
+// duplicate keys and therefore cannot use a map.
+func StringKeyValueSlices(values ...interface{}) (dictKeys []string, dictValues []interface{}, err error) {
+	dict := make(map[string]interface{})
+
+	if len(values) == 1 {
+		val, isNil := indirect(reflect.ValueOf(values[0]))
+		if isNil || values[0] == nil {
+			err = errors.New("Sdict: nil value passed")
+			return
+		}
+
+		if sdict, ok := val.Interface().(SDict); ok {
+			dict = sdict
+		}
+
+		switch val.Kind() {
+		case reflect.Map:
+			iter := val.MapRange()
+			for iter.Next() {
+
+				key, isNil := indirect(iter.Key())
+				if isNil {
+					err = errors.New("map with nil key encountered")
+					return
+				}
+				if key.Kind() == reflect.String {
+					dictKeys = append(dictKeys, key.String())
+					dictValues = append(dictValues, iter.Value().Interface())
+				} else {
+					err = errors.New("map has non string key of type: " + key.Type().String())
+					return
+				}
+			}
+			return
+		default:
+			err = errors.New("cannot convert data of type: " + reflect.TypeOf(values[0]).String())
+			return
+		}
+
+	}
+
+	if len(values)%2 != 0 {
+		err = errors.New("invalid dict call")
+		return
+	}
+	for i := 0; i < len(values); i += 2 {
+		key := values[i]
+		s, ok := key.(string)
+		if !ok {
+			err = errors.New("Only string keys supported in sdict")
+			return
+		}
+
+		dictKeys = append(dictKeys, s)
+		dictValues = append(dictValues, values[i+1])
+		dict[s] = values[i+1]
+	}
+	return
+}
+
 func KindOf(input interface{}, flag ...bool) (string, error) { //flag used only for indirect vs direct for now.
 
 	switch len(flag) {
@@ -132,7 +194,6 @@ func KindOf(input interface{}, flag ...bool) (string, error) { //flag used only 
 }
 
 func StructToSdict(value interface{}) (SDict, error) {
-
 	val, isNil := indirect(reflect.ValueOf(value))
 	typeOfS := val.Type()
 	if isNil || value == nil {
@@ -146,7 +207,7 @@ func StructToSdict(value interface{}) (SDict, error) {
 	fields := make(map[string]interface{})
 	for i := 0; i < val.NumField(); i++ {
 		curr := val.Field(i)
-		if curr.CanSet() {
+		if curr.CanInterface() {
 			fields[typeOfS.Field(i).Name] = curr.Interface()
 		}
 	}
@@ -156,10 +217,7 @@ func StructToSdict(value interface{}) (SDict, error) {
 
 func CreateSlice(values ...interface{}) (Slice, error) {
 	slice := make([]interface{}, len(values))
-	for i := 0; i < len(values); i++ {
-		slice[i] = values[i]
-	}
-
+	copy(slice, values)
 	return Slice(slice), nil
 }
 
@@ -209,29 +267,48 @@ func CreateMessageSend(values ...interface{}) (*discordgo.MessageSend, error) {
 		return m, nil
 	}
 
-	messageSdict, err := StringKeyDictionary(values...)
+	dictKeys, dictValues, err := StringKeyValueSlices(values...)
 	if err != nil {
 		return nil, err
 	}
 
-	msg := &discordgo.MessageSend{}
+	msg := &discordgo.MessageSend{
+		AllowedMentions: discordgo.AllowedMentions{
+			Parse: []discordgo.AllowedMentionType{discordgo.AllowedMentionTypeUsers},
+		},
+	}
 
-	for key, val := range messageSdict {
+	// Default filename
+	filename := "attachment_" + time.Now().Format("2006-01-02_15-04-05")
+	for i, key := range dictKeys {
+		val := dictValues[i]
 
-		switch key {
+		switch strings.ToLower(key) {
 		case "content":
-			msg.Content = fmt.Sprint(val)
+			msg.Content = ToString(val)
 		case "embed":
 			if val == nil {
 				continue
 			}
-			embed, err := CreateEmbed(val)
-			if err != nil {
-				return nil, err
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				const maxEmbeds = 10 // Discord limitation
+				for i := 0; i < v.Len() && i < maxEmbeds; i++ {
+					embed, err := CreateEmbed(v.Index(i).Interface())
+					if err != nil {
+						return nil, err
+					}
+					msg.Embeds = append(msg.Embeds, embed)
+				}
+			} else {
+				embed, err := CreateEmbed(val)
+				if err != nil {
+					return nil, err
+				}
+				msg.Embeds = append(msg.Embeds, embed)
 			}
-			msg.Embed = embed
 		case "file":
-			stringFile := fmt.Sprint(val)
+			stringFile := ToString(val)
 			if len(stringFile) > 100000 {
 				return nil, errors.New("file length for send message builder exceeded size limit")
 			}
@@ -239,14 +316,180 @@ func CreateMessageSend(values ...interface{}) (*discordgo.MessageSend, error) {
 			buf.WriteString(stringFile)
 
 			msg.File = &discordgo.File{
-				Name:        "Attachment.txt",
 				ContentType: "text/plain",
 				Reader:      &buf,
 			}
+		case "allowed_mentions":
+			if val == nil {
+				msg.AllowedMentions = discordgo.AllowedMentions{}
+				continue
+			}
+			parsed, err := parseAllowedMentions(val)
+			if err != nil {
+				return nil, err
+			}
+			msg.AllowedMentions = *parsed
+		case "filename":
+			// Cut the filename to a reasonable length if it's too long
+			filename = common.CutStringShort(ToString(val), 64)
+		case "reply":
+			msgID := ToInt64(val)
+			if msgID <= 0 {
+				return nil, errors.New(fmt.Sprintf("invalid message id '%s' provided to reply.", ToString(val)))
+			}
+			msg.Reference = &discordgo.MessageReference{
+				MessageID: msgID,
+			}
+		case "silent":
+			if val == nil || val == false {
+				continue
+			}
+			msg.Flags |= discordgo.MessageFlagsSuppressNotifications
+		case "components":
+			if val == nil {
+				continue
+			}
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				msg.Components, err = distributeComponents(v)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				var component discordgo.MessageComponent
+				switch comp := val.(type) {
+				case *discordgo.SelectMenu:
+					component = comp
+				case *discordgo.Button:
+					component = comp
+				default:
+					return nil, errors.New("invalid component passed to send message builder")
+				}
+				msg.Components = append(msg.Components, discordgo.ActionsRow{[]discordgo.MessageComponent{component}})
+			}
+		case "ephemeral":
+			if val == nil || val == false {
+				continue
+			}
+			msg.Flags |= discordgo.MessageFlagsEphemeral
+		case "buttons":
+			if val == nil {
+				continue
+			}
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				buttons := []*discordgo.Button{}
+				const maxButtons = 25 // Discord limitation
+				for i := 0; i < v.Len() && i < maxButtons; i++ {
+					button, err := CreateButton(v.Index(i).Interface())
+					if err != nil {
+						return nil, err
+					}
+					buttons = append(buttons, button)
+				}
+				comps, err := distributeComponents(reflect.ValueOf(buttons))
+				if err != nil {
+					return nil, err
+				}
+				msg.Components = append(msg.Components, comps...)
+			} else {
+				button, err := CreateButton(val)
+				if err != nil {
+					return nil, err
+				}
+				if button.Style == discordgo.LinkButton {
+					button.CustomID = ""
+				}
+				msg.Components = append(msg.Components, discordgo.ActionsRow{[]discordgo.MessageComponent{button}})
+			}
+		case "menus":
+			if val == nil {
+				continue
+			}
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				menus := []*discordgo.SelectMenu{}
+				const maxMenus = 5 // Discord limitation
+				for i := 0; i < v.Len() && i < maxMenus; i++ {
+					menu, err := CreateSelectMenu(v.Index(i).Interface())
+					if err != nil {
+						return nil, err
+					}
+					menus = append(menus, menu)
+				}
+				comps, err := distributeComponents(reflect.ValueOf(menus))
+				if err != nil {
+					return nil, err
+				}
+				msg.Components = append(msg.Components, comps...)
+			} else {
+				menu, err := CreateSelectMenu(val)
+				if err != nil {
+					return nil, err
+				}
+				msg.Components = append(msg.Components, discordgo.ActionsRow{[]discordgo.MessageComponent{menu}})
+			}
+		case "forward":
+			if val == nil {
+				continue
+			}
+			var m map[string]interface{}
+			switch t := val.(type) {
+			case SDict:
+				m = t
+			case *SDict:
+				m = *t
+			case map[string]interface{}:
+				m = t
+			default:
+				return nil, errors.New("invalid value passed to forward; must be an sdict with channel and message")
+			}
+
+			msg.Reference = &discordgo.MessageReference{
+				Type: 1,
+			}
+			for k, v := range m {
+				switch strings.ToLower(k) {
+				case "channel":
+					msg.Reference.ChannelID = ToInt64(v)
+					if msg.Reference.ChannelID <= 0 {
+						return nil, errors.New(fmt.Sprintf("invalid channel id '%s' provided to forward.", ToString(val)))
+					}
+				case "message":
+					msg.Reference.MessageID = ToInt64(v)
+					if msg.Reference.MessageID <= 0 {
+						return nil, errors.New(fmt.Sprintf("invalid message id '%s' provided to forward.", ToString(val)))
+					}
+				}
+			}
+		case "sticker":
+			if val == nil {
+				continue
+			}
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				const maxStickers = 3 // Discord limitation
+				for i := 0; i < v.Len() && i < maxStickers; i++ {
+					msg.StickerIDs = append(msg.StickerIDs, ToInt64(v.Index(i).Interface()))
+				}
+			} else {
+				msg.StickerIDs = append(msg.StickerIDs, ToInt64(val))
+			}
 		default:
-			return nil, errors.New(`invalid key "` + key + `" passed to send message builder`)
+			return nil, errors.New(`invalid key "` + key + `" passed to send message builder.`)
 		}
 
+	}
+	if msg.File != nil {
+		// We hardcode the extension to .txt to prevent possible abuse via .bat or other possible harmful/easily corruptable file formats
+		msg.File.Name = filename + ".txt"
+	}
+
+	if len(msg.Components) > 0 {
+		err := validateActionRowsCustomIDs(&msg.Components)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return msg, nil
@@ -260,36 +503,228 @@ func CreateMessageEdit(values ...interface{}) (*discordgo.MessageEdit, error) {
 	if m, ok := values[0].(*discordgo.MessageEdit); len(values) == 1 && ok {
 		return m, nil
 	}
-	messageSdict, err := StringKeyDictionary(values...)
+
+	dictKeys, dictValues, err := StringKeyValueSlices(values...)
 	if err != nil {
 		return nil, err
 	}
+
 	msg := &discordgo.MessageEdit{}
-
-	for key, val := range messageSdict {
-
-		switch key {
+	for i, key := range dictKeys {
+		val := dictValues[i]
+		switch strings.ToLower(key) {
 		case "content":
 			temp := fmt.Sprint(val)
 			msg.Content = &temp
 		case "embed":
 			if val == nil {
-				msg.Embed = (&discordgo.MessageEmbed{}).MarshalNil(true)
 				continue
 			}
-			embed, err := CreateEmbed(val)
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				const maxEmbeds = 10 // Discord limitation
+				for i := 0; i < v.Len() && i < maxEmbeds; i++ {
+					embed, err := CreateEmbed(v.Index(i).Interface())
+					if err != nil {
+						return nil, err
+					}
+					msg.Embeds = append(msg.Embeds, embed)
+				}
+			} else {
+				embed, err := CreateEmbed(val)
+				if err != nil {
+					return nil, err
+				}
+				msg.Embeds = append(msg.Embeds, embed)
+			}
+		case "silent":
+			if val == nil || val == false {
+				continue
+			}
+			msg.Flags |= discordgo.MessageFlagsSuppressNotifications
+		case "allowed_mentions":
+			if val == nil {
+				msg.AllowedMentions = discordgo.AllowedMentions{}
+				continue
+			}
+			parsed, err := parseAllowedMentions(val)
 			if err != nil {
 				return nil, err
 			}
-			msg.Embed = embed
+			msg.AllowedMentions = *parsed
+		case "components":
+			if val == nil {
+				continue
+			}
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				msg.Components, err = distributeComponents(v)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				var component discordgo.MessageComponent
+				switch comp := val.(type) {
+				case *discordgo.SelectMenu:
+					component = comp
+				case *discordgo.Button:
+					component = comp
+				default:
+					return nil, errors.New("invalid component passed to send message builder")
+				}
+				msg.Components = append(msg.Components, discordgo.ActionsRow{[]discordgo.MessageComponent{component}})
+			}
+		case "buttons":
+			if val == nil {
+				continue
+			}
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				buttons := []*discordgo.Button{}
+				const maxButtons = 25 // Discord limitation
+				for i := 0; i < v.Len() && i < maxButtons; i++ {
+					button, err := CreateButton(v.Index(i).Interface())
+					if err != nil {
+						return nil, err
+					}
+					buttons = append(buttons, button)
+				}
+				comps, err := distributeComponents(reflect.ValueOf(buttons))
+				if err != nil {
+					return nil, err
+				}
+				msg.Components = append(msg.Components, comps...)
+			} else {
+				button, err := CreateButton(val)
+				if err != nil {
+					return nil, err
+				}
+				if button.Style == discordgo.LinkButton {
+					button.CustomID = ""
+				}
+				msg.Components = append(msg.Components, discordgo.ActionsRow{[]discordgo.MessageComponent{button}})
+			}
+		case "menus":
+			if val == nil {
+				continue
+			}
+			v, _ := indirect(reflect.ValueOf(val))
+			if v.Kind() == reflect.Slice {
+				menus := []*discordgo.SelectMenu{}
+				const maxMenus = 5 // Discord limitation
+				for i := 0; i < v.Len() && i < maxMenus; i++ {
+					menu, err := CreateSelectMenu(v.Index(i).Interface())
+					if err != nil {
+						return nil, err
+					}
+					menus = append(menus, menu)
+				}
+				comps, err := distributeComponents(reflect.ValueOf(menus))
+				if err != nil {
+					return nil, err
+				}
+				msg.Components = append(msg.Components, comps...)
+			} else {
+				menu, err := CreateSelectMenu(val)
+				if err != nil {
+					return nil, err
+				}
+				msg.Components = append(msg.Components, discordgo.ActionsRow{[]discordgo.MessageComponent{menu}})
+			}
 		default:
 			return nil, errors.New(`invalid key "` + key + `" passed to message edit builder`)
 		}
 
 	}
 
+	if len(msg.Components) > 0 {
+		err := validateActionRowsCustomIDs(&msg.Components)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return msg, nil
 
+}
+
+func parseAllowedMentions(Data interface{}) (*discordgo.AllowedMentions, error) {
+
+	if m, ok := Data.(discordgo.AllowedMentions); ok {
+		return &m, nil
+	}
+
+	converted, err := StringKeyDictionary(Data)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsingUsers bool
+	var parsingRoles bool
+
+	allowedMentions := &discordgo.AllowedMentions{}
+	for k, v := range converted {
+
+		switch strings.ToLower(k) {
+		case "parse":
+			var parseMentions []discordgo.AllowedMentionType
+			var parseSlice Slice
+			conv, err := parseSlice.AppendSlice(v)
+			if err != nil {
+				return nil, errors.New(`Allowed Mentions Parsing: invalid datatype passed to "Parse", accepts a slice only`)
+			}
+			for _, elem := range conv.(Slice) {
+				elem_conv, _ := elem.(string)
+				if elem_conv != "users" && elem_conv != "roles" && elem_conv != "everyone" {
+					return nil, errors.New(`Allowed Mentions Parsing: invalid slice element in "Parse", accepts "roles", "users", and "everyone"`)
+				}
+				parseMentions = append(parseMentions, discordgo.AllowedMentionType(elem_conv))
+				if elem_conv == "users" {
+					parsingUsers = true
+				} else if elem_conv == "roles" {
+					parsingRoles = true
+				}
+			}
+			allowedMentions.Parse = parseMentions
+		case "users", "roles":
+			var newslice discordgo.IDSlice
+			var parseSlice Slice
+			conv, err := parseSlice.AppendSlice(v)
+			if err != nil {
+				return nil, fmt.Errorf(`allowed Mentions Parsing: invalid datatype passed to "%s", accepts a slice of snowflakes only`, k)
+			}
+			for _, elem := range conv.(Slice) {
+				if (ToInt64(elem)) == 0 {
+					return nil, fmt.Errorf(`allowed Mentions Parsing: "%s" IDSlice: invalid ID passed -`+fmt.Sprint(elem), k)
+				}
+				newslice = append(newslice, ToInt64(elem))
+			}
+			if len(newslice) > 100 {
+				newslice = newslice[:100]
+			}
+			if strings.ToLower(k) == "users" {
+				allowedMentions.Users = newslice
+			} else {
+				allowedMentions.Roles = newslice
+			}
+		case "replied_user":
+			isRepliedUserMention, ok := v.(bool)
+			if !ok {
+				return nil, errors.New(`Allowed Mentions Parsing: invalid datatype passed to "replied_user", accepts a bool only`)
+			}
+			allowedMentions.RepliedUser = isRepliedUserMention
+		default:
+			return nil, errors.New(`Allowed Mentions Parsing: invalid key "` + k + `" for Allowed Mentions`)
+		}
+	}
+
+	if parsingUsers && allowedMentions.Users != nil {
+		return nil, errors.New(`Allowed Mentions Parsing: conflicting values passed, you cannot parse all users if only allowing a set of users`)
+	} else if parsingRoles && allowedMentions.Roles != nil {
+		return nil, errors.New(`Allowed Mentions Parsing: conflicting values passed, you cannot parse all roles if only allowing a set of roles`)
+	}
+
+	return allowedMentions, nil
 }
 
 // indirect is taken from 'text/template/exec.go'
@@ -310,38 +745,40 @@ func in(l interface{}, v interface{}) bool {
 	lv, _ := indirect(reflect.ValueOf(l))
 	vv := reflect.ValueOf(v)
 
-	switch lv.Kind() {
-	case reflect.Array, reflect.Slice:
-		for i := 0; i < lv.Len(); i++ {
-			lvv := lv.Index(i)
-			lvv, isNil := indirect(lvv)
-			if isNil {
-				continue
-			}
-			switch lvv.Kind() {
-			case reflect.String:
-				if vv.Type() == lvv.Type() && vv.String() == lvv.String() {
-					return true
+	if !reflect.ValueOf(vv).IsZero() {
+		switch lv.Kind() {
+		case reflect.Array, reflect.Slice:
+			for i := 0; i < lv.Len(); i++ {
+				lvv := lv.Index(i)
+				lvv, isNil := indirect(lvv)
+				if isNil {
+					continue
 				}
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-				switch vv.Kind() {
+				switch lvv.Kind() {
+				case reflect.String:
+					if vv.Type() == lvv.Type() && vv.String() == lvv.String() {
+						return true
+					}
 				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-					if vv.Int() == lvv.Int() {
-						return true
+					switch vv.Kind() {
+					case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+						if vv.Int() == lvv.Int() {
+							return true
+						}
 					}
-				}
-			case reflect.Float32, reflect.Float64:
-				switch vv.Kind() {
 				case reflect.Float32, reflect.Float64:
-					if vv.Float() == lvv.Float() {
-						return true
+					switch vv.Kind() {
+					case reflect.Float32, reflect.Float64:
+						if vv.Float() == lvv.Float() {
+							return true
+						}
 					}
 				}
 			}
-		}
-	case reflect.String:
-		if vv.Type() == lv.Type() && strings.Contains(lv.String(), vv.String()) {
-			return true
+		case reflect.String:
+			if vv.Type() == lv.Type() && strings.Contains(lv.String(), vv.String()) {
+				return true
+			}
 		}
 	}
 
@@ -426,6 +863,57 @@ func tmplSub(args ...interface{}) interface{} {
 	}
 }
 
+var mathConstantsMap = map[string]float64{
+	//base
+	"e":   math.E,
+	"pi":  math.Pi,
+	"phi": math.Phi,
+
+	// square roots
+	"sqrt2":   math.Sqrt2,
+	"sqrte":   math.SqrtE,
+	"sqrtpi":  math.SqrtPi,
+	"sqrtphi": math.SqrtPhi,
+
+	// logarithms
+	"ln2":    math.Ln2,
+	"log2e":  math.Log2E,
+	"ln10":   math.Ln10,
+	"log10e": math.Log10E,
+
+	// floating-point limit values
+	"maxfloat32":             math.MaxFloat32,
+	"smallestnonzerofloat32": math.SmallestNonzeroFloat32,
+	"maxfloat64":             math.MaxFloat64,
+	"smallestnonzerofloat64": math.SmallestNonzeroFloat64,
+
+	// integer limit values
+	"maxint":    math.MaxInt,
+	"minint":    math.MinInt,
+	"maxint8":   math.MaxInt8,
+	"minint8":   math.MinInt8,
+	"maxint16":  math.MaxInt16,
+	"minint16":  math.MinInt16,
+	"maxint32":  math.MaxInt32,
+	"minint32":  math.MinInt32,
+	"maxint64":  math.MaxInt64,
+	"minint64":  math.MinInt64,
+	"maxuint":   math.MaxUint,
+	"maxuint8":  math.MaxUint8,
+	"maxuint16": math.MaxUint16,
+	"maxuint32": math.MaxUint32,
+	"maxuint64": math.MaxUint64,
+}
+
+func tmplMathConstant(arg string) float64 {
+	constant := mathConstantsMap[strings.ToLower(arg)]
+	if constant == 0 {
+		return math.NaN()
+	}
+
+	return constant
+}
+
 func tmplMult(args ...interface{}) interface{} {
 	if len(args) < 1 {
 		return 0
@@ -455,9 +943,9 @@ func tmplMult(args ...interface{}) interface{} {
 	}
 }
 
-func tmplDiv(args ...interface{}) interface{} {
+func tmplDiv(args ...interface{}) (interface{}, error) {
 	if len(args) < 1 {
-		return 0
+		return 0, nil
 	}
 
 	switch args[0].(type) {
@@ -470,17 +958,20 @@ func tmplDiv(args ...interface{}) interface{} {
 
 			sumF /= ToFloat64(v)
 		}
-		return sumF
+		return sumF, nil
 	default:
 		sumI := tmplToInt(args[0])
 		for i, v := range args {
 			if i == 0 {
 				continue
 			}
+			if tmplToInt(v) == 0 {
+				return 0, errors.New("integer divide by zero")
+			}
 
 			sumI /= tmplToInt(v)
 		}
-		return sumI
+		return sumI, nil
 	}
 }
 
@@ -545,8 +1036,46 @@ func tmplPow(argX, argY interface{}) float64 {
 	return math.Pow(xySlice[0], xySlice[1])
 }
 
-/*tmplLog is a function for templates using (log base of x = logarithm) as return value.
-It is using natural logarithm as default to change the base.*/
+func tmplMax(argX, argY interface{}) float64 {
+	var xyValue float64
+	var xySlice []float64
+
+	switchSlice := []interface{}{argX, argY}
+
+	for _, v := range switchSlice {
+		switch v.(type) {
+		case int, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64:
+			xyValue = ToFloat64(v)
+		default:
+			xyValue = math.NaN()
+		}
+		xySlice = append(xySlice, xyValue)
+	}
+	return math.Max(xySlice[0], xySlice[1])
+}
+
+func tmplMin(argX, argY interface{}) float64 {
+	var xyValue float64
+	var xySlice []float64
+
+	switchSlice := []interface{}{argX, argY}
+
+	for _, v := range switchSlice {
+		switch v.(type) {
+		case int, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64:
+			xyValue = ToFloat64(v)
+		default:
+			xyValue = math.NaN()
+		}
+		xySlice = append(xySlice, xyValue)
+	}
+	return math.Min(xySlice[0], xySlice[1])
+}
+
+/*
+tmplLog is a function for templates using (log base of x = logarithm) as return value.
+It is using natural logarithm as default to change the base.
+*/
 func tmplLog(arguments ...interface{}) (float64, error) {
 	var x, base, logarithm float64
 
@@ -572,7 +1101,38 @@ func tmplLog(arguments ...interface{}) (float64, error) {
 	return logarithm, nil
 }
 
-//tmplHumanizeThousands comma separates thousands
+func tmplBitwiseAnd(arg1, arg2 interface{}) int {
+	return tmplToInt(arg1) & tmplToInt(arg2)
+}
+
+func tmplBitwiseOr(args ...interface{}) (res int) {
+	for _, arg := range args {
+		res |= tmplToInt(arg)
+	}
+	return
+}
+
+func tmplBitwiseXor(arg1, arg2 interface{}) int {
+	return tmplToInt(arg1) ^ tmplToInt(arg2)
+}
+
+func tmplBitwiseNot(arg interface{}) int {
+	return ^tmplToInt(arg)
+}
+
+func tmplBitwiseAndNot(arg1, arg2 interface{}) int {
+	return tmplToInt(arg1) &^ tmplToInt(arg2)
+}
+
+func tmplBitwiseLeftShift(arg1, arg2 interface{}) int {
+	return tmplToInt(arg1) << tmplToInt(arg2)
+}
+
+func tmplBitwiseRightShift(arg1, arg2 interface{}) int {
+	return tmplToInt(arg1) >> tmplToInt(arg2)
+}
+
+// tmplHumanizeThousands comma separates thousands
 func tmplHumanizeThousands(input interface{}) string {
 	var f1, f2 string
 
@@ -603,7 +1163,7 @@ func roleIsAbove(a, b *discordgo.Role) bool {
 	return common.IsRoleAbove(a, b)
 }
 
-func randInt(args ...interface{}) int {
+func randInt(args ...interface{}) (int, error) {
 	min := int64(0)
 	max := int64(10)
 	if len(args) >= 2 {
@@ -613,8 +1173,13 @@ func randInt(args ...interface{}) int {
 		max = ToInt64(args[0])
 	}
 
-	r := rand.Int63n(max - min)
-	return int(r + min)
+	diff := max - min
+	if diff <= 0 {
+		return 0, errors.New("start must be strictly less than stop")
+	}
+
+	r := rand.Int63n(diff)
+	return int(r + min), nil
 }
 
 func tmplRound(args ...interface{}) float64 {
@@ -663,18 +1228,6 @@ func joinStrings(sep string, args ...interface{}) (string, error) {
 		case string:
 			builder.WriteString(t)
 
-		case []string:
-			for j, s := range t {
-				if j != 0 {
-					builder.WriteString(sep)
-				}
-
-				builder.WriteString(s)
-				if builder.Len() > MaxStringLength {
-					return "", ErrStringTooLong
-				}
-			}
-
 		case int, uint, int32, uint32, int64, uint64:
 			builder.WriteString(ToString(v))
 
@@ -684,6 +1237,22 @@ func joinStrings(sep string, args ...interface{}) (string, error) {
 		case fmt.Stringer:
 			builder.WriteString(t.String())
 
+		default:
+			cast, ok := castToStringSlice(reflect.ValueOf(v))
+			if !ok {
+				break
+			}
+
+			for j, s := range cast {
+				if j != 0 {
+					builder.WriteString(sep)
+				}
+
+				builder.WriteString(s)
+				if builder.Len() > MaxStringLength {
+					return "", ErrStringTooLong
+				}
+			}
 		}
 
 		if builder.Len() > MaxStringLength {
@@ -693,6 +1262,33 @@ func joinStrings(sep string, args ...interface{}) (string, error) {
 	}
 
 	return builder.String(), nil
+}
+
+var stringSliceType = reflect.TypeOf([]string(nil))
+
+func castToStringSlice(rv reflect.Value) ([]string, bool) {
+	rv, _ = indirect(rv)
+	switch rv.Kind() {
+	case reflect.Array, reflect.Slice:
+		// ok
+	default:
+		return nil, false
+	}
+
+	// fast path
+	if rv.Type() == stringSliceType {
+		return rv.Interface().([]string), true
+	}
+
+	ret := make([]string, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		irv, _ := indirect(rv.Index(i))
+		if irv.Kind() != reflect.String {
+			return nil, false
+		}
+		ret[i] = irv.String()
+	}
+	return ret, true
 }
 
 func sequence(start, stop int) ([]int, error) {
@@ -744,58 +1340,34 @@ func shuffle(seq interface{}) (interface{}, error) {
 }
 
 func tmplToInt(from interface{}) int {
-	switch t := from.(type) {
-	case int:
-		return t
-	case int32:
-		return int(t)
-	case int64:
-		return int(t)
-	case float32:
-		return int(t)
-	case float64:
-		return int(t)
-	case uint:
-		return int(t)
-	case uint8:
-		return int(t)
-	case uint32:
-		return int(t)
-	case uint64:
-		return int(t)
-	case string:
-		parsed, _ := strconv.ParseInt(t, 10, 64)
+	t := reflect.ValueOf(from)
+	switch {
+	case t.CanInt():
+		return int(t.Int())
+	case t.CanFloat():
+		return int(t.Float())
+	case t.CanUint():
+		return int(t.Uint())
+	case t.Kind() == reflect.String:
+		parsed, _ := strconv.ParseInt(t.String(), 10, 64)
 		return int(parsed)
-	case time.Duration:
-		return int(t)
 	default:
 		return 0
 	}
 }
 
 func ToInt64(from interface{}) int64 {
-	switch t := from.(type) {
-	case int:
-		return int64(t)
-	case int32:
-		return int64(t)
-	case int64:
-		return int64(t)
-	case float32:
-		return int64(t)
-	case float64:
-		return int64(t)
-	case uint:
-		return int64(t)
-	case uint32:
-		return int64(t)
-	case uint64:
-		return int64(t)
-	case string:
-		parsed, _ := strconv.ParseInt(t, 10, 64)
+	t := reflect.ValueOf(from)
+	switch {
+	case t.CanInt():
+		return t.Int()
+	case t.CanFloat():
+		return int64(t.Float())
+	case t.CanUint():
+		return int64(t.Uint())
+	case t.Kind() == reflect.String:
+		parsed, _ := strconv.ParseInt(t.String(), 10, 64)
 		return parsed
-	case time.Duration:
-		return int64(t)
 	default:
 		return 0
 	}
@@ -833,28 +1405,17 @@ func ToString(from interface{}) string {
 }
 
 func ToFloat64(from interface{}) float64 {
-	switch t := from.(type) {
-	case int:
-		return float64(t)
-	case int32:
-		return float64(t)
-	case int64:
-		return float64(t)
-	case float32:
-		return float64(t)
-	case float64:
-		return float64(t)
-	case uint:
-		return float64(t)
-	case uint32:
-		return float64(t)
-	case uint64:
-		return float64(t)
-	case string:
-		parsed, _ := strconv.ParseFloat(t, 64)
+	t := reflect.ValueOf(from)
+	switch {
+	case t.CanInt():
+		return float64(t.Int())
+	case t.CanFloat():
+		return t.Float()
+	case t.CanUint():
+		return float64(t.Uint())
+	case t.Kind() == reflect.String:
+		parsed, _ := strconv.ParseFloat(t.String(), 64)
 		return parsed
-	case time.Duration:
-		return float64(t)
 	default:
 		return 0
 	}
@@ -899,13 +1460,46 @@ func ToByte(from interface{}) []byte {
 	}
 }
 
-func tmplJson(v interface{}) (string, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "", err
+func tmplJson(v interface{}, flags ...bool) (string, error) {
+	var b []byte
+	var err error
+
+	switch len(flags) {
+
+	case 0:
+		b, err = json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+
+	case 1:
+		if flags[0] {
+			b, err = json.MarshalIndent(v, "", "\t")
+			if err != nil {
+				return "", err
+			}
+		} else {
+			b, err = json.Marshal(v)
+			if err != nil {
+				return "", err
+			}
+		}
+
+	default:
+		return "", errors.New("Too many flags")
 	}
 
 	return string(b), nil
+}
+
+func tmplJSONToSDict(v interface{}) (SDict, error) {
+	var toSDict SDict
+	err := json.Unmarshal([]byte(ToString(v)), &toSDict)
+	if err != nil {
+		return nil, err
+	}
+
+	return toSDict, nil
 }
 
 func tmplFormatTime(t time.Time, args ...string) string {
@@ -919,6 +1513,10 @@ func tmplFormatTime(t time.Time, args ...string) string {
 
 func tmplSnowflakeToTime(v interface{}) time.Time {
 	return bot.SnowflakeToTime(ToInt64(v)).UTC()
+}
+
+func tmplTimestampToTime(v interface{}) time.Time {
+	return time.Unix(ToInt64(v), 0).UTC()
 }
 
 type variadicFunc func([]reflect.Value) (reflect.Value, error)
@@ -940,7 +1538,8 @@ func callVariadic(f variadicFunc, skipNil bool, values ...reflect.Value) (reflec
 			}
 		case v.Kind() == reflect.Array || v.Kind() == reflect.Slice:
 			for i := 0; i < v.Len(); i++ {
-				vs = append(vs, v.Index(i))
+				irv, _ := indirect(v.Index(i))
+				vs = append(vs, irv)
 			}
 		default:
 			vs = append(vs, v)
@@ -1012,6 +1611,49 @@ func tmplCurrentTime() time.Time {
 	return time.Now().UTC()
 }
 
+func tmplParseTime(input string, layout interface{}, locations ...string) (time.Time, error) {
+	loc := time.UTC
+
+	var err error
+	if len(locations) > 0 {
+		loc, err = time.LoadLocation(locations[0])
+		if err != nil {
+			return time.Time{}, err
+		}
+	}
+
+	var parsed time.Time
+
+	rv, _ := indirect(reflect.ValueOf(layout))
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		if rv.Len() > 50 {
+			return time.Time{}, errors.New("max number of layouts is 50")
+		}
+
+		for i := 0; i < rv.Len(); i++ {
+			lv, _ := indirect(rv.Index(i))
+			if lv.Kind() != reflect.String {
+				return time.Time{}, errors.New("layout must be either a slice of strings or a single string")
+			}
+
+			parsed, err = time.ParseInLocation(lv.String(), input, loc)
+			if err == nil {
+				// found a layout that matched
+				break
+			}
+		}
+	case reflect.String:
+		parsed, _ = time.ParseInLocation(rv.String(), input, loc)
+	default:
+		return time.Time{}, errors.New("layout must be either a slice of strings or a single string")
+	}
+
+	// if no layout matched, parsed will be the zero Time.
+	// thus, users can call <time>.IsZero() to determine whether parseTime() was able to parse the time.
+	return parsed, nil
+}
+
 func tmplNewDate(year, monthInt, day, hour, min, sec int, location ...string) (time.Time, error) {
 	loc := time.UTC
 	month := time.Month(monthInt)
@@ -1032,16 +1674,16 @@ func tmplWeekNumber(t time.Time) (week int) {
 	return
 }
 
-func tmplHumanizeDurationHours(in time.Duration) string {
-	return common.HumanizeDuration(common.DurationPrecisionHours, in)
+func tmplHumanizeDurationHours(in interface{}) string {
+	return common.HumanizeDuration(common.DurationPrecisionHours, ToDuration(in))
 }
 
-func tmplHumanizeDurationMinutes(in time.Duration) string {
-	return common.HumanizeDuration(common.DurationPrecisionMinutes, in)
+func tmplHumanizeDurationMinutes(in interface{}) string {
+	return common.HumanizeDuration(common.DurationPrecisionMinutes, ToDuration(in))
 }
 
-func tmplHumanizeDurationSeconds(in time.Duration) string {
-	return common.HumanizeDuration(common.DurationPrecisionSeconds, in)
+func tmplHumanizeDurationSeconds(in interface{}) string {
+	return common.HumanizeDuration(common.DurationPrecisionSeconds, ToDuration(in))
 }
 
 func tmplHumanizeTimeSinceDays(in time.Time) string {

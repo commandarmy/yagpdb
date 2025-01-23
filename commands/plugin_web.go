@@ -12,18 +12,19 @@ import (
 	"unicode"
 
 	"emperror.dev/errors"
-	"github.com/botlabs-gg/yagpdb/commands/models"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/cplogs"
-	"github.com/botlabs-gg/yagpdb/common/featureflags"
-	"github.com/botlabs-gg/yagpdb/web"
-	"github.com/jonas747/dcmd/v4"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
+	"github.com/botlabs-gg/yagpdb/v2/commands/models"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/cplogs"
+	"github.com/botlabs-gg/yagpdb/v2/common/featureflags"
+	prfx "github.com/botlabs-gg/yagpdb/v2/common/prefix"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dcmd"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
+	"github.com/botlabs-gg/yagpdb/v2/web"
 	"github.com/mediocregopher/radix/v3"
-	"github.com/volatiletech/sqlboiler/boil"
-	"github.com/volatiletech/sqlboiler/queries/qm"
-	"github.com/volatiletech/sqlboiler/types"
+	"github.com/volatiletech/sqlboiler/v4/boil"
+	"github.com/volatiletech/sqlboiler/v4/queries/qm"
+	"github.com/volatiletech/sqlboiler/v4/types"
 	"goji.io"
 	"goji.io/pat"
 )
@@ -36,10 +37,11 @@ type ChannelOverrideForm struct {
 	ChannelCategories       []int64 `valid:"channel,true"`
 	Global                  bool
 	CommandsEnabled         bool
+	AlwaysEphemeral         bool
 	AutodeleteResponse      bool
 	AutodeleteTrigger       bool
-	AutodeleteResponseDelay int
-	AutodeleteTriggerDelay  int
+	AutodeleteResponseDelay int     `valid:"0,2678400"`
+	AutodeleteTriggerDelay  int     `valid:"0,2678400"`
 	RequireRoles            []int64 `valid:"role,true"`
 	IgnoreRoles             []int64 `valid:"role,true"`
 }
@@ -47,10 +49,11 @@ type ChannelOverrideForm struct {
 type CommandOverrideForm struct {
 	Commands                []string
 	CommandsEnabled         bool
+	AlwaysEphemeral         bool
 	AutodeleteResponse      bool
 	AutodeleteTrigger       bool
-	AutodeleteResponseDelay int
-	AutodeleteTriggerDelay  int
+	AutodeleteResponseDelay int     `valid:"0,2678400"`
+	AutodeleteTriggerDelay  int     `valid:"0,2678400"`
 	RequireRoles            []int64 `valid:"role,true"`
 	IgnoreRoles             []int64 `valid:"role,true"`
 }
@@ -175,7 +178,7 @@ func HandleCommands(w http.ResponseWriter, r *http.Request) (web.TemplateData, e
 	templateData["GlobalCommandSettings"] = global
 	templateData["ChannelOverrides"] = channelOverrides
 
-	prefix, _ := GetCommandPrefixRedis(activeGuild.ID)
+	prefix, _ := prfx.GetCommandPrefixRedis(activeGuild.ID)
 
 	templateData["CommandPrefix"] = prefix
 
@@ -220,6 +223,7 @@ func ChannelOverrideMiddleware(inner func(w http.ResponseWriter, r *http.Request
 					Global:          true,
 					GuildID:         activeGuild.ID,
 					CommandsEnabled: true,
+					AlwaysEphemeral: false,
 					Channels:        []int64{},
 					RequireRoles:    []int64{},
 					IgnoreRoles:     []int64{},
@@ -274,6 +278,7 @@ func HandleCreateChannelsOverride(w http.ResponseWriter, r *http.Request) (web.T
 		Channels:                formData.Channels,
 		ChannelCategories:       formData.ChannelCategories,
 		CommandsEnabled:         formData.CommandsEnabled,
+		AlwaysEphemeral:         formData.AlwaysEphemeral,
 		AutodeleteResponse:      formData.AutodeleteResponse,
 		AutodeleteTrigger:       formData.AutodeleteTrigger,
 		AutodeleteResponseDelay: formData.AutodeleteResponseDelay,
@@ -309,6 +314,7 @@ func HandleUpdateChannelsOverride(w http.ResponseWriter, r *http.Request, curren
 	currentOverride.Channels = formData.Channels
 	currentOverride.ChannelCategories = formData.ChannelCategories
 	currentOverride.CommandsEnabled = formData.CommandsEnabled
+	currentOverride.AlwaysEphemeral = formData.AlwaysEphemeral
 	currentOverride.AutodeleteResponse = formData.AutodeleteResponse
 	currentOverride.AutodeleteTrigger = formData.AutodeleteTrigger
 	currentOverride.AutodeleteResponseDelay = formData.AutodeleteResponseDelay
@@ -367,6 +373,7 @@ func HandleCreateCommandOverride(w http.ResponseWriter, r *http.Request, channel
 
 		Commands:                formData.Commands,
 		CommandsEnabled:         formData.CommandsEnabled,
+		AlwaysEphemeral:         formData.AlwaysEphemeral,
 		AutodeleteResponse:      formData.AutodeleteResponse,
 		AutodeleteTrigger:       formData.AutodeleteTrigger,
 		AutodeleteResponseDelay: formData.AutodeleteResponseDelay,
@@ -405,6 +412,7 @@ func HandleUpdateCommandOVerride(w http.ResponseWriter, r *http.Request, channel
 
 	override.Commands = formData.Commands
 	override.CommandsEnabled = formData.CommandsEnabled
+	override.AlwaysEphemeral = formData.AlwaysEphemeral
 	override.AutodeleteResponse = formData.AutodeleteResponse
 	override.AutodeleteTrigger = formData.AutodeleteTrigger
 	override.AutodeleteResponseDelay = formData.AutodeleteResponseDelay
@@ -448,7 +456,7 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 	templateData["SettingsPath"] = "/commands/settings"
 	templateData["WidgetEnabled"] = true
 
-	prefix, err := GetCommandPrefixRedis(ag.ID)
+	prefix, err := prfx.GetCommandPrefixRedis(ag.ID)
 	if err != nil {
 		return templateData, err
 	}

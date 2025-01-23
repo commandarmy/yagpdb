@@ -4,9 +4,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/botlabs-gg/yagpdb/automod/models"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
+	"github.com/botlabs-gg/yagpdb/v2/automod/models"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
 )
 
 // maps rule part indentifiers to actual condition types
@@ -46,6 +46,11 @@ var RulePartMap = map[int]RulePart{
 	31: &MessageAttachmentTrigger{},
 	32: &MessageAttachmentTrigger{RequiresAttachment: true},
 	33: &AntiPhishingLinkTrigger{},
+	34: &MessageLengthTrigger{},
+	35: &MessageLengthTrigger{Inverted: true},
+	36: &SlowmodeTrigger{Links: true, ChannelBased: false},
+	37: &SlowmodeTrigger{Links: true, ChannelBased: true},
+	38: &AutomodExecution{},
 
 	// Conditions 2xx
 	200: &MemberRolesCondition{Blacklist: true},
@@ -62,6 +67,12 @@ var RulePartMap = map[int]RulePart{
 	212: &ChannelCategoriesCondition{Blacklist: false},
 	213: &MessageEditedCondition{NewMessage: true},
 	214: &MessageEditedCondition{NewMessage: false},
+	215: &ThreadCondition{true},
+	216: &ThreadCondition{false},
+	217: &MessageAttachmentCondition{true},
+	218: &MessageAttachmentCondition{false},
+	219: &MessageForwardCondition{true},
+	220: &MessageForwardCondition{false},
 
 	// Effects 3xx
 	300: &DeleteMessageEffect{},
@@ -76,6 +87,9 @@ var RulePartMap = map[int]RulePart{
 	309: &GiveRoleEffect{},
 	311: &EnableChannelSlowmodeEffect{},
 	312: &RemoveRoleEffect{},
+	313: &SendChannelMessageEffect{},
+	314: &TimeoutUserEffect{},
+	315: &SendModeratorAlertMessageEffect{},
 }
 
 var InverseRulePartMap = make(map[RulePart]int)
@@ -117,11 +131,12 @@ const (
 )
 
 type SettingDef struct {
-	Name     string
-	Key      string
-	Kind     SettingType
-	Min, Max int
-	Default  interface{} `json:",omitempty"`
+	Name        string
+	Key         string
+	Kind        SettingType
+	Min, Max    int
+	Default     interface{} `json:",omitempty"`
+	Placeholder string      `json:",omitempty"`
 }
 
 type RulePartType int
@@ -219,7 +234,7 @@ type TriggerContext struct {
 type MessageTrigger interface {
 	RulePart
 
-	CheckMessage(triggerCtx *TriggerContext, cs *dstate.ChannelState, m *discordgo.Message, mdStripped string) (isAffected bool, err error)
+	CheckMessage(triggerCtx *TriggerContext, cs *dstate.ChannelState, m *discordgo.Message) (isAffected bool, err error)
 }
 
 // ViolationListener is a trigger that gets triggered on a violation
@@ -248,4 +263,11 @@ type JoinListener interface {
 	RulePart
 
 	CheckJoin(triggerCtx *TriggerContext) (isAffected bool, err error)
+}
+
+// AutomodListener is a trigger for when Discord's built in automod kicks in
+type AutomodListener interface {
+	RulePart
+
+	CheckRuleID(triggerCtx *TriggerContext, ruleID int64) (isAffected bool, err error)
 }

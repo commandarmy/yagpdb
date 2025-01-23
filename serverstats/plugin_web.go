@@ -11,16 +11,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/cplogs"
-	"github.com/botlabs-gg/yagpdb/common/pubsub"
-	"github.com/botlabs-gg/yagpdb/premium"
-	"github.com/botlabs-gg/yagpdb/serverstats/models"
-	"github.com/botlabs-gg/yagpdb/web"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/cplogs"
+	"github.com/botlabs-gg/yagpdb/v2/common/pubsub"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/premium"
+	"github.com/botlabs-gg/yagpdb/v2/serverstats/models"
+	"github.com/botlabs-gg/yagpdb/v2/web"
 	"github.com/karlseguin/rcache"
-	"github.com/volatiletech/null"
-	"github.com/volatiletech/sqlboiler/boil"
+	"github.com/volatiletech/null/v8"
+	"github.com/volatiletech/sqlboiler/v4/boil"
 	"goji.io"
 	"goji.io/pat"
 )
@@ -324,7 +324,7 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 
 	const format = `<ul>
 	<li>Public stats: %s</li>
-	<li>Blacklisted channnels: <code>%d</code></li>
+	<li>Disallowed channnels: <code>%d</code></li>
 </ul>`
 
 	templateData["WidgetBody"] = template.HTML(fmt.Sprintf(format, web.EnabledDisabledSpanStatus(config.Public), len(config.ParsedChannels)))

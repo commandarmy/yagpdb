@@ -2,22 +2,27 @@ package templates
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"emperror.dev/errors"
-	"github.com/botlabs-gg/yagpdb/bot"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/scheduledevents2"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
-	"github.com/jonas747/template"
+	"github.com/botlabs-gg/yagpdb/v2/bot"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/prefix"
+	"github.com/botlabs-gg/yagpdb/v2/common/scheduledevents2"
+	"github.com/botlabs-gg/yagpdb/v2/lib/confusables"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
+	"github.com/botlabs-gg/yagpdb/v2/lib/template"
+	"github.com/botlabs-gg/yagpdb/v2/web/discorddata"
 	"github.com/sirupsen/logrus"
 	"github.com/vmihailenco/msgpack"
 )
@@ -35,61 +40,88 @@ var (
 		"toByte":     ToByte,
 
 		// string manipulation
-		"hasPrefix": strings.HasPrefix,
-		"hasSuffix": strings.HasSuffix,
-		"joinStr":   joinStrings,
-		"lower":     strings.ToLower,
-		"slice":     slice,
-		"split":     strings.Split,
-		"title":     strings.Title,
-		"trimSpace": strings.TrimSpace,
-		"upper":     strings.ToUpper,
-		"urlescape": url.PathEscape,
-		"print":     withOutputLimit(fmt.Sprint, MaxStringLength),
-		"println":   withOutputLimit(fmt.Sprintln, MaxStringLength),
-		"printf":    withOutputLimitF(fmt.Sprintf, MaxStringLength),
+		"hasPrefix":    strings.HasPrefix,
+		"hasSuffix":    strings.HasSuffix,
+		"joinStr":      joinStrings,
+		"lower":        strings.ToLower,
+		"slice":        slice,
+		"split":        strings.Split,
+		"title":        strings.Title,
+		"trimSpace":    strings.TrimSpace,
+		"upper":        strings.ToUpper,
+		"urlescape":    url.PathEscape,
+		"urlunescape":  url.PathUnescape,
+		"print":        withOutputLimit(fmt.Sprint, MaxStringLength),
+		"println":      withOutputLimit(fmt.Sprintln, MaxStringLength),
+		"printf":       withOutputLimitF(fmt.Sprintf, MaxStringLength),
+		"sanitizeText": confusables.SanitizeText,
+
+		// regexp
+		"reQuoteMeta": regexp.QuoteMeta,
 
 		// math
-		"add":               add,
-		"sub":               tmplSub,
-		"mult":              tmplMult,
-		"div":               tmplDiv,
-		"mod":               tmplMod,
-		"fdiv":              tmplFDiv,
-		"cbrt":              tmplCbrt,
-		"sqrt":              tmplSqrt,
-		"pow":               tmplPow,
-		"log":               tmplLog,
-		"round":             tmplRound,
-		"roundCeil":         tmplRoundCeil,
-		"roundFloor":        tmplRoundFloor,
-		"roundEven":         tmplRoundEven,
-		"humanizeThousands": tmplHumanizeThousands,
+		"add":        add,
+		"cbrt":       tmplCbrt,
+		"div":        tmplDiv,
+		"fdiv":       tmplFDiv,
+		"log":        tmplLog,
+		"mathConst":  tmplMathConstant,
+		"max":        tmplMax,
+		"min":        tmplMin,
+		"mod":        tmplMod,
+		"mult":       tmplMult,
+		"pow":        tmplPow,
+		"round":      tmplRound,
+		"roundCeil":  tmplRoundCeil,
+		"roundEven":  tmplRoundEven,
+		"roundFloor": tmplRoundFloor,
+		"sqrt":       tmplSqrt,
+		"sub":        tmplSub,
+
+		// bitwise ops
+		"bitwiseAnd":        tmplBitwiseAnd,
+		"bitwiseOr":         tmplBitwiseOr,
+		"bitwiseXor":        tmplBitwiseXor,
+		"bitwiseNot":        tmplBitwiseNot,
+		"bitwiseAndNot":     tmplBitwiseAndNot,
+		"bitwiseLeftShift":  tmplBitwiseLeftShift,
+		"bitwiseRightShift": tmplBitwiseRightShift,
 
 		// misc
+		"humanizeThousands":  tmplHumanizeThousands,
 		"dict":               Dictionary,
 		"sdict":              StringKeyDictionary,
 		"structToSdict":      StructToSdict,
 		"cembed":             CreateEmbed,
+		"cbutton":            CreateButton,
+		"cmenu":              CreateSelectMenu,
+		"cmodal":             CreateModal,
 		"cslice":             CreateSlice,
 		"complexMessage":     CreateMessageSend,
 		"complexMessageEdit": CreateMessageEdit,
 		"kindOf":             KindOf,
 
-		"formatTime":      tmplFormatTime,
-		"snowflakeToTime": tmplSnowflakeToTime,
-		"loadLocation":    time.LoadLocation,
-		"json":            tmplJson,
-		"in":              in,
-		"inFold":          inFold,
-		"roleAbove":       roleIsAbove,
-		"adjective":       common.RandomAdjective,
-		"noun":            common.RandomNoun,
-		"randInt":         randInt,
-		"shuffle":         shuffle,
-		"seq":             sequence,
+		"adjective":   common.RandomAdjective,
+		"in":          in,
+		"inFold":      inFold,
+		"json":        tmplJson,
+		"jsonToSdict": tmplJSONToSDict,
+		"noun":        common.RandomNoun,
+		"randInt":     randInt,
+		"roleAbove":   roleIsAbove,
+		"seq":         sequence,
+
+		"shuffle": shuffle,
+		"verb":    common.RandomVerb,
+
+		// time functions
 		"currentTime":     tmplCurrentTime,
+		"parseTime":       tmplParseTime,
+		"formatTime":      tmplFormatTime,
+		"loadLocation":    time.LoadLocation,
 		"newDate":         tmplNewDate,
+		"snowflakeToTime": tmplSnowflakeToTime,
+		"timestampToTime": tmplTimestampToTime,
 		"weekNumber":      tmplWeekNumber,
 
 		"humanizeDurationHours":   tmplHumanizeDurationHours,
@@ -103,8 +135,6 @@ var (
 
 var logger = common.GetFixedPrefixLogger("templates")
 
-func TODO() {}
-
 type ContextSetupFunc func(ctx *Context)
 
 func RegisterSetupFunc(f ContextSetupFunc) {
@@ -113,6 +143,7 @@ func RegisterSetupFunc(f ContextSetupFunc) {
 
 func init() {
 	RegisterSetupFunc(baseContextFuncs)
+	RegisterSetupFunc(interactionContextFuncs)
 
 	msgpack.RegisterExt(1, (*SDict)(nil))
 	msgpack.RegisterExt(2, (*Dict)(nil))
@@ -121,6 +152,18 @@ func init() {
 
 // set by the premium package to return wether this guild is premium or not
 var GuildPremiumFunc func(guildID int64) (bool, error)
+
+// Defines where a template was executed from to enable certain restrictions
+type ExecutedFromType int
+
+const (
+	ExecutedFromStandard              ExecutedFromType = 0
+	ExecutedFromJoin                  ExecutedFromType = 1
+	ExecutedFromLeave                 ExecutedFromType = 2
+	ExecutedFromEvalCC                ExecutedFromType = 3
+	ExecutedFromCommandTemplate       ExecutedFromType = 4
+	ExecutedFromNestedCommandTemplate ExecutedFromType = 5
+)
 
 type Context struct {
 	Name string
@@ -142,29 +185,39 @@ type Context struct {
 
 	RegexCache map[string]*regexp.Regexp
 
-	CurrentFrame *contextFrame
+	CurrentFrame *ContextFrame
 
-	IsExecedByLeaveMessage bool
+	ExecutedFrom ExecutedFromType
 
 	contextFuncsAdded bool
 }
 
-type contextFrame struct {
+type ContextFrame struct {
 	CS *dstate.ChannelState
 
 	MentionEveryone bool
 	MentionHere     bool
 	MentionRoles    []int64
 
-	DelResponse bool
+	DelResponse       bool
+	PublishResponse   bool
+	EphemeralResponse bool
 
 	DelResponseDelay         int
-	EmebdsToSend             []*discordgo.MessageEmbed
+	EmbedsToSend             []*discordgo.MessageEmbed
+	ComponentsToSend         []discordgo.MessageComponent
 	AddResponseReactionNames []string
 
 	isNestedTemplate bool
 	parsedTemplate   *template.Template
 	SendResponseInDM bool
+
+	Interaction *CustomCommandInteraction
+}
+
+type CustomCommandInteraction struct {
+	*discordgo.Interaction
+	RespondedTo bool
 }
 
 func NewContext(gs *dstate.GuildSet, cs *dstate.ChannelState, ms *dstate.MemberState) *Context {
@@ -178,7 +231,7 @@ func NewContext(gs *dstate.GuildSet, cs *dstate.ChannelState, ms *dstate.MemberS
 		Data:         make(map[string]interface{}),
 		Counters:     make(map[string]int),
 
-		CurrentFrame: &contextFrame{
+		CurrentFrame: &ContextFrame{
 			CS: cs,
 		},
 	}
@@ -204,6 +257,7 @@ func (c *Context) setupBaseData() {
 		c.Data["Guild"] = c.GS
 		c.Data["Server"] = c.GS
 		c.Data["server"] = c.GS
+		c.Data["ServerPrefix"] = prefix.GetPrefixIgnoreError(c.GS.ID)
 	}
 
 	if c.CurrentFrame.CS != nil {
@@ -219,17 +273,33 @@ func (c *Context) setupBaseData() {
 	}
 
 	if c.MS != nil {
+		c.Data["BotUser"] = common.BotUser
 		c.Data["Member"] = c.MS.DgoMember()
 		c.Data["User"] = &c.MS.User
 		c.Data["user"] = c.Data["User"]
 	}
 
-	c.Data["TimeSecond"] = time.Second
-	c.Data["TimeMinute"] = time.Minute
-	c.Data["TimeHour"] = time.Hour
-	c.Data["UnixEpoch"] = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 	c.Data["DiscordEpoch"] = time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.Data["DomainRegex"] = common.DomainFinderRegex.String()
 	c.Data["IsPremium"] = c.IsPremium
+	c.Data["LinkRegex"] = common.LinkRegex.String()
+	c.Data["TimeHour"] = time.Hour
+	c.Data["TimeMinute"] = time.Minute
+	c.Data["TimeSecond"] = time.Second
+	c.Data["UnixEpoch"] = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	permNameToBit := make(map[string]int64)
+	for _, p := range discordgo.AllPermissions {
+		permNameToBit[discordgo.PermissionName(p)] = p
+	}
+
+	// for backward compatibility with previous versions
+	permNameToBit["ReadMessages"] = discordgo.PermissionViewChannel
+	permNameToBit["ManageEmojis"] = discordgo.PermissionManageGuildExpressions
+	permNameToBit["ManageServer"] = discordgo.PermissionManageGuild
+	permNameToBit["ViewAuditLogs"] = discordgo.PermissionViewAuditLog
+
+	c.Data["Permissions"] = permNameToBit
 }
 
 func (c *Context) Parse(source string) (*template.Template, error) {
@@ -250,8 +320,10 @@ func (c *Context) Parse(source string) (*template.Template, error) {
 }
 
 const (
-	MaxOpsNormal  = 1000000
-	MaxOpsPremium = 2500000
+	MaxOpsNormal      = 1000000
+	MaxOpsPremium     = 2500000
+	MaxOpsEvalNormal  = 5000
+	MaxOpsEvalPremium = 10000
 )
 
 func (c *Context) Execute(source string) (string, error) {
@@ -267,15 +339,20 @@ func (c *Context) Execute(source string) (string, error) {
 		}
 		if c.GS != nil {
 			c.Msg.GuildID = c.GS.ID
-
-			member, err := bot.GetMember(c.GS.ID, c.BotUser.ID)
-			if err != nil {
-				return "", errors.WithMessage(err, "ctx.Execute")
+			if bot.State != nil {
+				member, err := bot.GetMember(c.GS.ID, c.BotUser.ID)
+				if err != nil {
+					return "", errors.WithMessage(err, "ctx.Execute")
+				}
+				c.Msg.Member = member.DgoMember()
+			} else {
+				member, err := discorddata.GetMember(c.GS.ID, c.BotUser.ID)
+				if err != nil {
+					return "", errors.WithMessage(err, "ctx.Execute")
+				}
+				c.Msg.Member = member
 			}
-
-			c.Msg.Member = member.DgoMember()
 		}
-
 	}
 
 	c.setupBaseData()
@@ -294,8 +371,14 @@ func (c *Context) executeParsed() (string, error) {
 
 	if c.IsPremium {
 		parsed = parsed.MaxOps(MaxOpsPremium)
+		if c.ExecutedFrom == ExecutedFromEvalCC {
+			parsed = parsed.MaxOps(MaxOpsEvalPremium)
+		}
 	} else {
 		parsed = parsed.MaxOps(MaxOpsNormal)
+		if c.ExecutedFrom == ExecutedFromEvalCC {
+			parsed = parsed.MaxOps(MaxOpsEvalNormal)
+		}
 	}
 
 	var buf bytes.Buffer
@@ -322,9 +405,9 @@ func (c *Context) executeParsed() (string, error) {
 }
 
 // creates a new context frame and returns the old one
-func (c *Context) newContextFrame(cs *dstate.ChannelState) *contextFrame {
+func (c *Context) newContextFrame(cs *dstate.ChannelState) *ContextFrame {
 	old := c.CurrentFrame
-	c.CurrentFrame = &contextFrame{
+	c.CurrentFrame = &ContextFrame{
 		CS:               cs,
 		isNestedTemplate: true,
 	}
@@ -334,6 +417,9 @@ func (c *Context) newContextFrame(cs *dstate.ChannelState) *contextFrame {
 
 func (c *Context) ExecuteAndSendWithErrors(source string, channelID int64) error {
 	out, err := c.Execute(source)
+
+	// trim whitespace for accurate character count
+	out = strings.TrimSpace(out)
 
 	if utf8.RuneCountInString(out) > 2000 {
 		out = "Template output for " + c.Name + " was longer than 2k (contact an admin on the server...)"
@@ -367,10 +453,28 @@ func (c *Context) MessageSend(content string) *discordgo.MessageSend {
 }
 
 // SendResponse sends the response and handles reactions and the like
-func (c *Context) SendResponse(content string) (*discordgo.Message, error) {
+func (c *Context) SendResponse(content string) (m *discordgo.Message, err error) {
 	channelID := int64(0)
 
-	if !c.CurrentFrame.SendResponseInDM {
+	sendType := sendMessageGuildChannel
+	if c.CurrentFrame.Interaction != nil {
+		if c.CurrentFrame.Interaction.RespondedTo {
+			sendType = sendMessageInteractionFollowup
+		} else {
+			sendType = sendMessageInteractionResponse
+		}
+	} else if c.CurrentFrame.SendResponseInDM || (c.CurrentFrame.CS != nil && c.CurrentFrame.CS.IsPrivate()) {
+		sendType = sendMessageDM
+		if c.CurrentFrame.CS != nil && c.CurrentFrame.CS.Type == discordgo.ChannelTypeDM {
+			channelID = c.CurrentFrame.CS.ID
+		} else {
+			privChannel, err := common.BotSession.UserChannelCreate(c.MS.User.ID)
+			if err != nil {
+				return nil, err
+			}
+			channelID = privChannel.ID
+		}
+	} else {
 		if c.CurrentFrame.CS == nil {
 			return nil, nil
 		}
@@ -381,59 +485,108 @@ func (c *Context) SendResponse(content string) (*discordgo.Message, error) {
 		}
 
 		channelID = c.CurrentFrame.CS.ID
-	} else {
-		if c.CurrentFrame.CS != nil && c.CurrentFrame.CS.Type == discordgo.ChannelTypeDM {
-			channelID = c.CurrentFrame.CS.ID
-		} else {
-			privChannel, err := common.BotSession.UserChannelCreate(c.MS.User.ID)
-			if err != nil {
-				return nil, err
-			}
-			channelID = privChannel.ID
-		}
 	}
 
-	isDM := c.CurrentFrame.SendResponseInDM || (c.CurrentFrame.CS != nil && c.CurrentFrame.CS.IsPrivate())
-
-	for _, v := range c.CurrentFrame.EmebdsToSend {
-		if isDM {
-			v.Footer = &discordgo.MessageEmbedFooter{
-				Text:    "Custom Command DM from the server " + c.GS.Name,
-				IconURL: c.GS.Icon,
-			}
+	msgSend := c.MessageSend("")
+	var embeds []*discordgo.MessageEmbed
+	embeds = append(embeds, c.CurrentFrame.EmbedsToSend...)
+	msgSend.Embeds = embeds
+	msgSend.Content = content
+	if len(c.CurrentFrame.ComponentsToSend) > 0 {
+		msgSend.Components = append(msgSend.Components, c.CurrentFrame.ComponentsToSend...)
+		if len(msgSend.Components) > 5 {
+			msgSend.Components = msgSend.Components[:5]
 		}
-
-		common.BotSession.ChannelMessageSendEmbed(channelID, v)
 	}
-
-	if strings.TrimSpace(content) == "" || (c.CurrentFrame.DelResponse && c.CurrentFrame.DelResponseDelay < 1) {
+	if (len(msgSend.Embeds) == 0 && strings.TrimSpace(content) == "" && len(msgSend.Components) == 0) || (c.CurrentFrame.DelResponse && c.CurrentFrame.DelResponseDelay < 1) {
 		// no point in sending the response if it gets deleted immedietely
 		return nil, nil
 	}
-
-	if isDM {
-		content = "Custom Command DM from the server **" + c.GS.Name + "**\n" + content
+	if sendType == sendMessageDM {
+		msgSend.Components = []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    "Show Server Info",
+						Style:    discordgo.PrimaryButton,
+						Emoji:    &discordgo.ComponentEmoji{Name: "📬"},
+						CustomID: fmt.Sprintf("DM_%d", c.GS.ID),
+					},
+				},
+			},
+		}
 	}
 
-	m, err := common.BotSession.ChannelMessageSendComplex(channelID, c.MessageSend(content))
+	if c.CurrentFrame.EphemeralResponse {
+		msgSend.Flags |= discordgo.MessageFlagsEphemeral
+	}
+
+	var getErr error
+
+	switch sendType {
+	case sendMessageInteractionResponse:
+		err = common.BotSession.CreateInteractionResponse(c.CurrentFrame.Interaction.ID, c.CurrentFrame.Interaction.Token, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content:         msgSend.Content,
+				Embeds:          msgSend.Embeds,
+				AllowedMentions: &msgSend.AllowedMentions,
+				Flags:           msgSend.Flags,
+			},
+		})
+		if err == nil {
+			c.CurrentFrame.Interaction.RespondedTo = true
+			m, getErr = common.BotSession.GetOriginalInteractionResponse(common.BotApplication.ID, c.CurrentFrame.Interaction.Token)
+		}
+	case sendMessageInteractionFollowup:
+		m, err = common.BotSession.CreateFollowupMessage(common.BotApplication.ID, c.CurrentFrame.Interaction.Token, &discordgo.WebhookParams{
+			Content:         msgSend.Content,
+			Embeds:          msgSend.Embeds,
+			AllowedMentions: &msgSend.AllowedMentions,
+			Flags:           int64(msgSend.Flags),
+		})
+	default:
+		m, err = common.BotSession.ChannelMessageSendComplex(channelID, msgSend)
+	}
+
 	if err != nil {
 		logger.WithError(err).Error("Failed sending message")
+	} else if getErr != nil {
+		logger.WithError(getErr).Error("Failed getting interaction response")
 	} else {
 		if c.CurrentFrame.DelResponse {
-			MaybeScheduledDeleteMessage(c.GS.ID, channelID, m.ID, c.CurrentFrame.DelResponseDelay)
+			var maybeToken string
+			if c.CurrentFrame.Interaction != nil {
+				maybeToken = c.CurrentFrame.Interaction.Token
+			}
+			MaybeScheduledDeleteMessage(c.GS.ID, channelID, m.ID, c.CurrentFrame.DelResponseDelay, maybeToken)
 		}
+		if !c.CurrentFrame.EphemeralResponse {
+			if len(c.CurrentFrame.AddResponseReactionNames) > 0 {
+				go func(frame *ContextFrame) {
+					for _, v := range frame.AddResponseReactionNames {
+						common.BotSession.MessageReactionAdd(m.ChannelID, m.ID, v)
+					}
+				}(c.CurrentFrame)
+			}
 
-		if len(c.CurrentFrame.AddResponseReactionNames) > 0 {
-			go func(frame *contextFrame) {
-				for _, v := range frame.AddResponseReactionNames {
-					common.BotSession.MessageReactionAdd(m.ChannelID, m.ID, v)
-				}
-			}(c.CurrentFrame)
+			if c.CurrentFrame.PublishResponse && c.CurrentFrame.CS.Type == discordgo.ChannelTypeGuildNews {
+				common.BotSession.ChannelMessageCrosspost(m.ChannelID, m.ID)
+			}
 		}
 	}
 
-	return m, nil
+	return
 }
+
+type sendMessageType uint
+
+const (
+	sendMessageGuildChannel        sendMessageType = 0
+	sendMessageDM                  sendMessageType = 1
+	sendMessageInteractionResponse sendMessageType = 2
+	sendMessageInteractionFollowup sendMessageType = 3
+)
 
 // IncreaseCheckCallCounter Returns true if key is above the limit
 func (c *Context) IncreaseCheckCallCounter(key string, limit int) bool {
@@ -466,11 +619,10 @@ func (c *Context) IncreaseCheckCallCounterPremium(key string, normalLimit, premi
 }
 
 func (c *Context) IncreaseCheckGenericAPICall() bool {
+	if c.ExecutedFrom == ExecutedFromEvalCC {
+		return c.IncreaseCheckCallCounter("api_call", 20)
+	}
 	return c.IncreaseCheckCallCounter("api_call", 100)
-}
-
-func (c *Context) IncreaseCheckStateLock() bool {
-	return c.IncreaseCheckCallCounter("state_lock", 500)
 }
 
 func (c *Context) LogEntry() *logrus.Entry {
@@ -497,78 +649,131 @@ func (c *Context) addContextFunc(name string, f interface{}) {
 }
 
 func baseContextFuncs(c *Context) {
-	// message functions
-	c.addContextFunc("sendDM", c.tmplSendDM)
-	c.addContextFunc("sendMessage", c.tmplSendMessage(true, false))
-	c.addContextFunc("sendTemplate", c.tmplSendTemplate)
-	c.addContextFunc("sendTemplateDM", c.tmplSendTemplateDM)
-	c.addContextFunc("sendMessageRetID", c.tmplSendMessage(true, true))
-	c.addContextFunc("sendMessageNoEscape", c.tmplSendMessage(false, false))
-	c.addContextFunc("sendMessageNoEscapeRetID", c.tmplSendMessage(false, true))
+	// Message functions
+	c.addContextFunc("deleteMessage", c.tmplDelMessage)
+	c.addContextFunc("deleteResponse", c.tmplDelResponse)
+	c.addContextFunc("deleteTrigger", c.tmplDelTrigger)
+
 	c.addContextFunc("editMessage", c.tmplEditMessage(true))
 	c.addContextFunc("editMessageNoEscape", c.tmplEditMessage(false))
+	c.addContextFunc("getMessage", c.tmplGetMessage)
 	c.addContextFunc("pinMessage", c.tmplPinMessage(false))
+	c.addContextFunc("publishMessage", c.tmplPublishMessage)
+	c.addContextFunc("publishResponse", c.tmplPublishResponse)
 	c.addContextFunc("unpinMessage", c.tmplPinMessage(true))
 
-	// Mentions
+	// Message send functions
+	c.addContextFunc("sendDM", c.tmplSendDM)
+	c.addContextFunc("sendMessage", c.tmplSendMessage(true, false))
+	c.addContextFunc("sendMessageNoEscape", c.tmplSendMessage(false, false))
+	c.addContextFunc("sendMessageNoEscapeRetID", c.tmplSendMessage(false, true))
+	c.addContextFunc("sendMessageRetID", c.tmplSendMessage(true, true))
+
+	c.addContextFunc("sendTemplate", c.tmplSendTemplate)
+	c.addContextFunc("sendTemplateDM", c.tmplSendTemplateDM)
+
+	// Reaction functions
+	c.addContextFunc("addMessageReactions", c.tmplAddMessageReactions)
+	c.addContextFunc("addReactions", c.tmplAddReactions)
+	c.addContextFunc("addResponseReactions", c.tmplAddResponseReactions)
+
+	c.addContextFunc("deleteAllMessageReactions", c.tmplDelAllMessageReactions)
+	c.addContextFunc("deleteMessageReaction", c.tmplDelMessageReaction)
+
+	// Mention functions
 	c.addContextFunc("mentionEveryone", c.tmplMentionEveryone)
 	c.addContextFunc("mentionHere", c.tmplMentionHere)
+	c.addContextFunc("mentionRole", c.tmplMentionRole)
 	c.addContextFunc("mentionRoleName", c.tmplMentionRoleName)
 	c.addContextFunc("mentionRoleID", c.tmplMentionRoleID)
 
 	// Role functions
-	c.addContextFunc("hasRoleName", c.tmplHasRoleName)
+	c.addContextFunc("getRole", c.tmplGetRole)
+	c.addContextFunc("getRoleID", c.tmplGetRoleID)
+	c.addContextFunc("getRoleName", c.tmplGetRoleName)
+
+	c.addContextFunc("hasRole", c.tmplHasRole)
 	c.addContextFunc("hasRoleID", c.tmplHasRoleID)
+	c.addContextFunc("hasRoleName", c.tmplHasRoleName)
 
-	c.addContextFunc("addRoleID", c.tmplAddRoleID)
-	c.addContextFunc("removeRoleID", c.tmplRemoveRoleID)
-
-	c.addContextFunc("setRoles", c.tmplSetRoles)
-	c.addContextFunc("addRoleName", c.tmplAddRoleName)
-	c.addContextFunc("removeRoleName", c.tmplRemoveRoleName)
-
-	c.addContextFunc("giveRoleID", c.tmplGiveRoleID)
-	c.addContextFunc("giveRoleName", c.tmplGiveRoleName)
-
-	c.addContextFunc("takeRoleID", c.tmplTakeRoleID)
-	c.addContextFunc("takeRoleName", c.tmplTakeRoleName)
-
+	c.addContextFunc("targetHasRole", c.tmplTargetHasRole)
 	c.addContextFunc("targetHasRoleID", c.tmplTargetHasRoleID)
 	c.addContextFunc("targetHasRoleName", c.tmplTargetHasRoleName)
 
-	c.addContextFunc("deleteResponse", c.tmplDelResponse)
-	c.addContextFunc("deleteTrigger", c.tmplDelTrigger)
-	c.addContextFunc("deleteMessage", c.tmplDelMessage)
-	c.addContextFunc("deleteMessageReaction", c.tmplDelMessageReaction)
-	c.addContextFunc("deleteAllMessageReactions", c.tmplDelAllMessageReactions)
-	c.addContextFunc("getMessage", c.tmplGetMessage)
-	c.addContextFunc("getMember", c.tmplGetMember)
-	c.addContextFunc("getChannel", c.tmplGetChannel)
-	c.addContextFunc("getThread", c.tmplGetThread)
-	c.addContextFunc("getChannelOrThread", c.tmplGetChannelOrThread)
-	c.addContextFunc("getPinCount", c.tmplGetChannelPinCount)
-	c.addContextFunc("getRole", c.tmplGetRole)
-	c.addContextFunc("addReactions", c.tmplAddReactions)
-	c.addContextFunc("addResponseReactions", c.tmplAddResponseReactions)
-	c.addContextFunc("addMessageReactions", c.tmplAddMessageReactions)
+	c.addContextFunc("giveRole", c.tmplGiveRole)
+	c.addContextFunc("giveRoleID", c.tmplGiveRoleID)
+	c.addContextFunc("giveRoleName", c.tmplGiveRoleName)
 
-	c.addContextFunc("currentUserCreated", c.tmplCurrentUserCreated)
+	c.addContextFunc("addRole", c.tmplAddRole)
+	c.addContextFunc("addRoleID", c.tmplAddRoleID)
+	c.addContextFunc("addRoleName", c.tmplAddRoleName)
+
+	c.addContextFunc("takeRole", c.tmplTakeRole)
+	c.addContextFunc("takeRoleID", c.tmplTakeRoleID)
+	c.addContextFunc("takeRoleName", c.tmplTakeRoleName)
+
+	c.addContextFunc("removeRole", c.tmplRemoveRole)
+	c.addContextFunc("removeRoleID", c.tmplRemoveRoleID)
+	c.addContextFunc("removeRoleName", c.tmplRemoveRoleName)
+
+	c.addContextFunc("setRoles", c.tmplSetRoles)
+
+	// Permission functions
+	c.addContextFunc("hasPermissions", c.tmplHasPermissions)
+	c.addContextFunc("targetHasPermissions", c.tmplTargetHasPermissions)
+	c.addContextFunc("getTargetPermissionsIn", c.tmplGetTargetPermissionsIn)
+
+	// Channel functions
+	c.addContextFunc("editChannelName", c.tmplEditChannelName)
+	c.addContextFunc("editChannelTopic", c.tmplEditChannelTopic)
+
+	c.addContextFunc("getChannel", c.tmplGetChannel)
+	c.addContextFunc("getChannelPins", c.tmplGetChannelPins(false))
+	c.addContextFunc("getChannelOrThread", c.tmplGetChannelOrThread)
+	c.addContextFunc("getPinCount", c.tmplGetChannelPins(true))
+
+	// Member functions
+	c.addContextFunc("getMember", c.tmplGetMember)
+	c.addContextFunc("getMemberVoiceState", c.tmplGetMemberVoiceState)
+	c.addContextFunc("editNickname", c.tmplEditNickname)
+
+	// Thread functions
+	c.addContextFunc("addThreadMember", c.tmplThreadMemberAdd)
+	c.addContextFunc("closeThread", c.tmplCloseThread)
+	c.addContextFunc("createThread", c.tmplCreateThread)
+	c.addContextFunc("deleteThread", c.tmplDeleteThread)
+	c.addContextFunc("editThread", c.tmplEditThread)
+	c.addContextFunc("getThread", c.tmplGetThread)
+	c.addContextFunc("openThread", c.tmplOpenThread)
+	c.addContextFunc("removeThreadMember", c.tmplThreadMemberRemove)
+
+	// Forum functions
+	c.addContextFunc("createForumPost", c.tmplCreateForumPost)
+	c.addContextFunc("deleteForumPost", c.tmplDeleteThread)
+	c.addContextFunc("pinForumPost", c.tmplPinForumPost(false))
+	c.addContextFunc("unpinForumPost", c.tmplPinForumPost(true))
+
+	// User functions
 	c.addContextFunc("currentUserAgeHuman", c.tmplCurrentUserAgeHuman)
 	c.addContextFunc("currentUserAgeMinutes", c.tmplCurrentUserAgeMinutes)
-	c.addContextFunc("sleep", c.tmplSleep)
+	c.addContextFunc("currentUserCreated", c.tmplCurrentUserCreated)
+
+	// RegEx functions
 	c.addContextFunc("reFind", c.reFind)
 	c.addContextFunc("reFindAll", c.reFindAll)
 	c.addContextFunc("reFindAllSubmatches", c.reFindAllSubmatches)
 	c.addContextFunc("reReplace", c.reReplace)
 	c.addContextFunc("reSplit", c.reSplit)
 
-	c.addContextFunc("editChannelTopic", c.tmplEditChannelTopic)
-	c.addContextFunc("editChannelName", c.tmplEditChannelName)
+	// Miscellaneous functions
 	c.addContextFunc("onlineCount", c.tmplOnlineCount)
 	c.addContextFunc("onlineCountBots", c.tmplOnlineCountBots)
-	c.addContextFunc("editNickname", c.tmplEditNickname)
 
+	c.addContextFunc("sleep", c.tmplSleep)
 	c.addContextFunc("sort", c.tmplSort)
+	c.addContextFunc("hash", c.tmplSha256)
+	c.addContextFunc("decodeBase64", c.tmplDecodeBase64)
+	c.addContextFunc("encodeBase64", c.tmplEncodeBase64)
 }
 
 type limitedWriter struct {
@@ -599,27 +804,38 @@ func LimitWriter(w io.Writer, n int64) io.Writer {
 	return &limitedWriter{W: w, N: n}
 }
 
-func MaybeScheduledDeleteMessage(guildID, channelID, messageID int64, delaySeconds int) {
-	if delaySeconds > 10 {
+func MaybeScheduledDeleteMessage(guildID, channelID, messageID int64, delaySeconds int, token string) {
+	if delaySeconds > 10 && token == "" {
 		err := scheduledevents2.ScheduleDeleteMessages(guildID, channelID, time.Now().Add(time.Second*time.Duration(delaySeconds)), messageID)
 		if err != nil {
 			logger.WithError(err).Error("failed scheduling message deletion")
 		}
 	} else {
+		if delaySeconds > 10 {
+			delaySeconds = 10
+		}
 		go func() {
 			if delaySeconds > 0 {
 				time.Sleep(time.Duration(delaySeconds) * time.Second)
 			}
 
+			if token != "" {
+				if messageID != 0 {
+					common.BotSession.DeleteFollowupMessage(common.BotApplication.ID, token, messageID)
+				} else {
+					common.BotSession.DeleteInteractionResponse(common.BotApplication.ID, token)
+				}
+				return
+			}
 			bot.MessageDeleteQueue.DeleteMessages(guildID, channelID, messageID)
 		}()
 	}
 }
 
-func isMaybeContainer(v interface{}) bool {
+func isContainer(v interface{}) bool {
 	rv, _ := indirect(reflect.ValueOf(v))
 	switch rv.Kind() {
-	case reflect.Array, reflect.Slice, reflect.Interface, reflect.Map, reflect.Struct:
+	case reflect.Array, reflect.Slice, reflect.Map:
 		return true
 	default:
 		return false
@@ -687,10 +903,13 @@ func detectCyclicValue(v interface{}) error {
 type Dict map[interface{}]interface{}
 
 func (d Dict) Set(key interface{}, value interface{}) (string, error) {
+	if key == nil {
+		return "", errors.New("key cannot be nil")
+	}
 	d[key] = value
-	if isMaybeContainer(value) {
+	if isContainer(value) {
 		if err := detectCyclicValue(d); err != nil {
-			return "", err
+			return "", template.UncatchableError(err)
 		}
 	}
 	return "", nil
@@ -719,13 +938,35 @@ func (d Dict) HasKey(k interface{}) (ok bool) {
 	return
 }
 
+func (d Dict) MarshalJSON() ([]byte, error) {
+	md := make(map[string]interface{})
+
+	for k, v := range d {
+		if k == nil {
+			return nil, errors.New("key is nil, cannot parse to json")
+		}
+		krv := reflect.ValueOf(k)
+		switch krv.Kind() {
+		case reflect.String:
+			md[krv.String()] = v
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			md[strconv.FormatInt(krv.Int(), 10)] = v
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			md[strconv.FormatUint(krv.Uint(), 10)] = v
+		default:
+			return nil, fmt.Errorf("cannot encode dict with key type %s; only string and integer keys are supported", krv.Type())
+		}
+	}
+	return json.Marshal(md)
+}
+
 type SDict map[string]interface{}
 
 func (d SDict) Set(key string, value interface{}) (string, error) {
 	d[key] = value
-	if isMaybeContainer(value) {
+	if isContainer(value) {
 		if err := detectCyclicValue(d); err != nil {
-			return "", err
+			return "", template.UncatchableError(err)
 		}
 	}
 	return "", nil
@@ -768,9 +1009,9 @@ func (s Slice) Set(index int, item interface{}) (string, error) {
 	}
 
 	s[index] = item
-	if isMaybeContainer(item) {
+	if isContainer(item) {
 		if err := detectCyclicValue(s); err != nil {
-			return "", err
+			return "", template.UncatchableError(err)
 		}
 	}
 	return "", nil

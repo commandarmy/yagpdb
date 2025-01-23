@@ -7,12 +7,12 @@ import (
 	"html/template"
 	"net/http"
 
-	"github.com/botlabs-gg/yagpdb/commands"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/cplogs"
-	"github.com/botlabs-gg/yagpdb/tickets/models"
-	"github.com/botlabs-gg/yagpdb/web"
-	"github.com/volatiletech/sqlboiler/boil"
+	"github.com/botlabs-gg/yagpdb/v2/commands"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/cplogs"
+	"github.com/botlabs-gg/yagpdb/v2/tickets/models"
+	"github.com/botlabs-gg/yagpdb/v2/web"
+	"github.com/volatiletech/sqlboiler/v4/boil"
 	"goji.io/pat"
 )
 
@@ -31,6 +31,8 @@ type FormData struct {
 	ModRoles                           []int64 `valid:"role"`
 	AdminRoles                         []int64 `valid:"role"`
 	TicketOpenMSG                      string  `valid:"template,10000"`
+	AppendButtonsClose                 bool
+	AppendButtonsCloseWithReason       bool
 }
 
 var panelLogKey = cplogs.RegisterActionFormat(&cplogs.ActionFormat{Key: "tickets_updated_settings", FormatString: "Updated ticket settings"})
@@ -67,8 +69,13 @@ func (p *Plugin) handleGetSettings(w http.ResponseWriter, r *http.Request) (web.
 		settings = &models.TicketConfig{}
 	}
 
+	appendButtons := map[string]bool {}
+	appendButtons["Close"] = settings.AppendButtons & AppendButtonsClose == AppendButtonsClose
+	appendButtons["CloseWithReason"] = settings.AppendButtons & AppendButtonsCloseWithReason == AppendButtonsCloseWithReason
+
 	templateData["DefaultTicketMessage"] = DefaultTicketMsg
 	templateData["PluginSettings"] = settings
+	templateData["PluginSettingsAppendButtons"] = appendButtons
 
 	return templateData, nil
 }
@@ -79,12 +86,21 @@ func (p *Plugin) handlePostSettings(w http.ResponseWriter, r *http.Request) (web
 
 	formConfig := ctx.Value(common.ContextKeyParsedForm).(*FormData)
 
+	var appendButtons int64
+	if formConfig.AppendButtonsClose {
+		appendButtons = appendButtons | AppendButtonsClose
+	}
+	if formConfig.AppendButtonsCloseWithReason {
+		appendButtons = appendButtons | AppendButtonsCloseWithReason
+	}
+
 	model := &models.TicketConfig{
 		GuildID:                            activeGuild.ID,
 		Enabled:                            formConfig.Enabled,
 		TicketsChannelCategory:             formConfig.TicketsChannelCategory,
 		TicketsTranscriptsChannel:          formConfig.TicketsTranscriptsChannel,
 		TicketsTranscriptsChannelAdminOnly: formConfig.TicketsTranscriptsChannelAdminOnly,
+		AppendButtons:                      appendButtons,
 		StatusChannel:                      formConfig.StatusChannel,
 		TicketsUseTXTTranscripts:           formConfig.TicketsUseTXTTranscripts,
 		DownloadAttachments:                formConfig.DownloadAttachments,
@@ -113,10 +129,7 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 		return templateData, err
 	}
 
-	enabled := false
-	if settings != nil {
-		enabled = true
-	}
+	enabled := settings != nil && settings.Enabled
 
 	templateData["WidgetTitle"] = "Tickets"
 	templateData["SettingsPath"] = "/tickets/settings"

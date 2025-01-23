@@ -8,11 +8,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/botlabs-gg/yagpdb/bot"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/jonas747/dcmd/v4"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/jonas747/dstate/v4"
+	"github.com/botlabs-gg/yagpdb/v2/bot"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dcmd"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dstate"
 )
 
 type DurationArg struct {
@@ -21,19 +21,22 @@ type DurationArg struct {
 
 var _ dcmd.ArgType = (*DurationArg)(nil)
 
-func (d *DurationArg) Matches(def *dcmd.ArgDef, part string) bool {
+func (d *DurationArg) CheckCompatibility(def *dcmd.ArgDef, part string) dcmd.CompatibilityResult {
 	if len(part) < 1 {
-		return false
+		return dcmd.Incompatible
 	}
 
 	// We "need" the first character to be a number
 	r, _ := utf8.DecodeRuneInString(part)
 	if !unicode.IsNumber(r) {
-		return false
+		return dcmd.Incompatible
 	}
 
 	_, err := common.ParseDuration(part)
-	return err == nil
+	if err != nil {
+		return dcmd.Incompatible
+	}
+	return dcmd.CompatibilityGood
 }
 
 func (d *DurationArg) ParseFromMessage(def *dcmd.ArgDef, part string, data *dcmd.Data) (interface{}, error) {
@@ -79,7 +82,7 @@ func (d *DurationArg) HelpName() string {
 }
 
 func (d *DurationArg) SlashCommandOptions(def *dcmd.ArgDef) []*discordgo.ApplicationCommandOption {
-	return []*discordgo.ApplicationCommandOption{def.StandardSlashCommandOption(discordgo.CommandOptionTypeString)}
+	return []*discordgo.ApplicationCommandOption{def.StandardSlashCommandOption(discordgo.ApplicationCommandOptionString)}
 }
 
 type DurationOutOfRangeError struct {
@@ -151,10 +154,9 @@ func CommonContainerNotFoundHandler(container *dcmd.Container, fixedMessage stri
 	return func(data *dcmd.Data) (interface{}, error) {
 		// Only show stuff if atleast 1 of the commands in the container is enabled
 		if data.GuildData != nil {
-			cParentID := data.GuildData.CS.ParentID
 			ms := data.GuildData.MS
 
-			channelOverrides, err := GetOverridesForChannel(data.ChannelID, cParentID, data.GuildData.GS.ID)
+			channelOverrides, err := GetOverridesForChannel(data.GuildData.CS, data.GuildData.GS)
 			if err != nil {
 				logger.WithError(err).WithField("guild", data.GuildData.GS.ID).Error("failed retrieving command overrides")
 				return nil, nil
@@ -213,19 +215,14 @@ type MemberArg struct{}
 
 var _ dcmd.ArgType = (*MemberArg)(nil)
 
-func (ma *MemberArg) Matches(def *dcmd.ArgDef, part string) bool {
+func (ma *MemberArg) CheckCompatibility(def *dcmd.ArgDef, part string) dcmd.CompatibilityResult {
 	// Check for mention
 	if strings.HasPrefix(part, "<@") && strings.HasSuffix(part, ">") {
-		return true
+		return dcmd.DetermineSnowflakeCompatibility(strings.TrimPrefix(part[2:len(part)-1], "!"))
 	}
 
 	// Check for ID
-	_, err := strconv.ParseInt(part, 10, 64)
-	if err == nil {
-		return true
-	}
-
-	return false
+	return dcmd.DetermineSnowflakeCompatibility(part)
 }
 
 func (ma *MemberArg) ParseFromMessage(def *dcmd.ArgDef, part string, data *dcmd.Data) (interface{}, error) {
@@ -286,7 +283,7 @@ func (ma *MemberArg) HelpName() string {
 }
 
 func (ma *MemberArg) SlashCommandOptions(def *dcmd.ArgDef) []*discordgo.ApplicationCommandOption {
-	return []*discordgo.ApplicationCommandOption{def.StandardSlashCommandOption(discordgo.CommandOptionTypeUser)}
+	return []*discordgo.ApplicationCommandOption{def.StandardSlashCommandOption(discordgo.ApplicationCommandOptionUser)}
 }
 
 type EphemeralOrGuild struct {
@@ -308,7 +305,7 @@ func (e *EphemeralOrGuild) Send(data *dcmd.Data) ([]*discordgo.Message, error) {
 	default:
 		send := &discordgo.MessageSend{
 			Content:         e.Content,
-			Embed:           e.Embed,
+			Embeds:          []*discordgo.MessageEmbed{e.Embed},
 			AllowedMentions: discordgo.AllowedMentions{},
 		}
 
@@ -341,11 +338,19 @@ func (e *EphemeralOrNone) Send(data *dcmd.Data) ([]*discordgo.Message, error) {
 		// 	Content: "Failed running the command.",
 		// })
 
-		// Yeah so because the original reaction response is not marked as ephemeral, and there's no way to change that, just delete it i guess...
-		// because otherwise the followup message turns into the original response
-		err := data.Session.DeleteInteractionResponse(common.BotApplication.ID, data.SlashCommandTriggerData.Interaction.Token)
-		if err != nil {
-			return nil, err
+		if yc, ok := data.Cmd.Command.(*YAGCommand); ok {
+			settings, err := yc.GetSettings(data.ContainerChain, data.GuildData.CS, data.GuildData.GS)
+			if err != nil {
+				return nil, err
+			}
+			if !(yc.IsResponseEphemeral || settings.AlwaysEphemeral) {
+				// Yeah so because the original reaction response is not marked as ephemeral, and there's no way to change that, just delete it i guess...
+				// because otherwise the followup message turns into the original response
+				err := data.Session.DeleteInteractionResponse(common.BotApplication.ID, data.SlashCommandTriggerData.Interaction.Token)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 
 		m, err := data.Session.CreateFollowupMessage(common.BotApplication.ID, data.SlashCommandTriggerData.Interaction.Token, params)
@@ -373,23 +378,17 @@ type RoleArg struct{}
 
 var _ dcmd.ArgType = (*RoleArg)(nil)
 
-func (ra *RoleArg) Matches(def *dcmd.ArgDef, part string) bool {
+func (ra *RoleArg) CheckCompatibility(def *dcmd.ArgDef, part string) dcmd.CompatibilityResult {
 	// Check for mention
 	if strings.HasPrefix(part, "<@&") && strings.HasSuffix(part, ">") {
-		return true
+		return dcmd.DetermineSnowflakeCompatibility(part[3 : len(part)-1])
 	}
 
-	// Check for ID
-	_, err := strconv.ParseInt(part, 10, 64)
-	if err == nil {
-		return true
+	if part != "" {
+		// role name can be essentially any string
+		return dcmd.CompatibilityGood
 	}
-
-	if len(part) > 0 {
-		return true
-	}
-
-	return false
+	return dcmd.Incompatible
 }
 
 func (ra *RoleArg) ParseFromMessage(def *dcmd.ArgDef, part string, data *dcmd.Data) (interface{}, error) {
@@ -422,7 +421,7 @@ func (ra *RoleArg) ParseFromInteraction(def *dcmd.ArgDef, data *dcmd.Data, optio
 }
 
 func (ra *RoleArg) SlashCommandOptions(def *dcmd.ArgDef) []*discordgo.ApplicationCommandOption {
-	return []*discordgo.ApplicationCommandOption{def.StandardSlashCommandOption(discordgo.CommandOptionTypeRole)}
+	return []*discordgo.ApplicationCommandOption{def.StandardSlashCommandOption(discordgo.ApplicationCommandOptionRole)}
 }
 
 func (ra *RoleArg) ExtractID(part string, data *dcmd.Data) interface{} {

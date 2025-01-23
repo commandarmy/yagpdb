@@ -2,10 +2,10 @@ package automod_legacy
 
 import (
 	"emperror.dev/errors"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/featureflags"
-	"github.com/botlabs-gg/yagpdb/web"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/featureflags"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/web"
 )
 
 var logger = common.GetPluginLogger(&Plugin{})
@@ -29,13 +29,13 @@ func RegisterPlugin() {
 
 func (p *Plugin) PluginInfo() *common.PluginInfo {
 	return &common.PluginInfo{
-		Name:     "Basic Automod",
+		Name:     "Basic Automoderator",
 		SysName:  "legacy_automod",
 		Category: common.PluginCategoryModeration,
 	}
 }
 
-func (p *Plugin) Name() string    { return "Basic Automod" }
+func (p *Plugin) Name() string    { return "Basic Automoderator" }
 func (p *Plugin) SysName() string { return "legacy_automod" }
 
 type Config struct {
@@ -52,10 +52,10 @@ func (c Config) Name() string {
 	return "Automoderator"
 }
 
-func NewConfig() *Config {
+func DefaultConfig() *Config {
 	return &Config{
-		Spam:    &SpamRule{},
-		Mention: &MentionRule{},
+		Spam:    &SpamRule{NumMessages: 1, Within: 5},
+		Mention: &MentionRule{Treshold: 1},
 		Invite:  &InviteRule{},
 		Links:   &LinksRule{},
 		Sites:   &SitesRule{},
@@ -64,9 +64,21 @@ func NewConfig() *Config {
 }
 
 func GetConfig(guildID int64) (config *Config, err error) {
-
-	config = NewConfig()
 	err = common.GetRedisJson(KeyConfig(guildID), &config)
+	if config == nil {
+		config = DefaultConfig()
+	}
+	// This is needed for legacy reason
+	// because the validation for this is via a common middleware which may break a heck lot of things if tinkered with.
+	if config.Spam.NumMessages == 0 {
+		config.Spam.NumMessages = 1
+	}
+	if config.Spam.Within == 0 {
+		config.Spam.Within = 5
+	}
+	if config.Mention.Treshold == 0 {
+		config.Mention.Treshold = 1
+	}
 	return
 }
 

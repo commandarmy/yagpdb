@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sirupsen/logrus"
@@ -135,13 +135,6 @@ func DiscordGatewayLogger(shardID int, connectionID int, msgL int, msgf string, 
 	default:
 		f.Infof("[GATEWAY] "+msgf, args...)
 	}
-}
-
-type GORMLogger struct {
-}
-
-func (g *GORMLogger) Print(v ...interface{}) {
-	logrus.WithField("stck", "...").Error(v...)
 }
 
 type LoggingTransport struct {

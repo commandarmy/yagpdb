@@ -5,8 +5,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
 )
 
 type ModlogAction struct {
@@ -27,19 +27,22 @@ func (m ModlogAction) String() string {
 }
 
 var (
-	MAMute       = ModlogAction{Prefix: "Muted", Emoji: "🔇", Color: 0x57728e}
-	MAUnmute     = ModlogAction{Prefix: "Unmuted", Emoji: "🔊", Color: 0x62c65f}
-	MAKick       = ModlogAction{Prefix: "Kicked", Emoji: "👢", Color: 0xf2a013}
-	MABanned     = ModlogAction{Prefix: "Banned", Emoji: "🔨", Color: 0xd64848}
-	MAUnbanned   = ModlogAction{Prefix: "Unbanned", Emoji: "🔓", Color: 0x62c65f}
-	MAWarned     = ModlogAction{Prefix: "Warned", Emoji: "⚠", Color: 0xfca253}
-	MAGiveRole   = ModlogAction{Prefix: "", Emoji: "➕", Color: 0x53fcf9}
-	MARemoveRole = ModlogAction{Prefix: "", Emoji: "➖", Color: 0x53fcf9}
+	MAMute           = ModlogAction{Prefix: "Muted", Emoji: "🔇", Color: 0x57728e}
+	MAUnmute         = ModlogAction{Prefix: "Unmuted", Emoji: "🔊", Color: 0x62c65f}
+	MAKick           = ModlogAction{Prefix: "Kicked", Emoji: "👢", Color: 0xf2a013}
+	MABanned         = ModlogAction{Prefix: "Banned", Emoji: "🔨", Color: 0xd64848}
+	MAUnbanned       = ModlogAction{Prefix: "Unbanned", Emoji: "🔓", Color: 0x62c65f}
+	MAWarned         = ModlogAction{Prefix: "Warned", Emoji: "⚠", Color: 0xfca253}
+	MADelwarn      	 = ModlogAction{Prefix: "Warning removed from", Emoji: "🧽", Color: 0xfca253}
+	MATimeoutAdded   = ModlogAction{Prefix: "Timed out", Emoji: "⏱", Color: 0x9b59b6}
+	MATimeoutRemoved = ModlogAction{Prefix: "Timeout removed from", Emoji: "⏱", Color: 0x9b59b6}
+	MAGiveRole       = ModlogAction{Prefix: "", Emoji: "➕", Color: 0x53fcf9}
+	MARemoveRole     = ModlogAction{Prefix: "", Emoji: "➖", Color: 0x53fcf9}
+	MAClearWarnings  = ModlogAction{Prefix: "Cleared warnings", Emoji: "👌", Color: 0x62c65f}
 )
 
 func CreateModlogEmbed(config *Config, author *discordgo.User, action ModlogAction, target *discordgo.User, reason, logLink string) error {
-	channelID := config.IntActionChannel()
-	config.GetGuildID()
+	channelID := config.ActionChannel
 	if channelID == 0 {
 		return nil
 	}
@@ -60,15 +63,15 @@ func CreateModlogEmbed(config *Config, author *discordgo.User, action ModlogActi
 
 	embed := &discordgo.MessageEmbed{
 		Author: &discordgo.MessageEmbedAuthor{
-			Name:    fmt.Sprintf("%s#%s (ID %d)", author.Username, author.Discriminator, author.ID),
+			Name:    fmt.Sprintf("%s (ID %d)", author.String(), author.ID),
 			IconURL: discordgo.EndpointUserAvatar(author.ID, author.Avatar),
 		},
 		Thumbnail: &discordgo.MessageEmbedThumbnail{
 			URL: discordgo.EndpointUserAvatar(target.ID, target.Avatar),
 		},
 		Color: action.Color,
-		Description: fmt.Sprintf("**%s%s** %s#%s *(ID %d)*\n📄**Reason:** %s",
-			action.Emoji, action.Prefix, target.Username, target.Discriminator, target.ID, reason),
+		Description: fmt.Sprintf("**%s%s** %s *(ID %d)*\n📄**Reason:** %s",
+			action.Emoji, action.Prefix, target.String(), target.ID, reason),
 	}
 
 	if logLink != "" {
@@ -83,10 +86,11 @@ func CreateModlogEmbed(config *Config, author *discordgo.User, action ModlogActi
 
 	m, err := common.BotSession.ChannelMessageSendEmbed(channelID, embed)
 	if err != nil {
+		logger.WithError(err).Errorf("Creating modlog embed for guild_id %d, action_channel %d", config.GuildID, config.ActionChannel)
 		if common.IsDiscordErr(err, discordgo.ErrCodeMissingAccess, discordgo.ErrCodeMissingPermissions, discordgo.ErrCodeUnknownChannel) {
 			// disable the modlog
-			config.ActionChannel = ""
-			config.Save(config.GetGuildID())
+			config.ActionChannel = 0
+			SaveConfig(config)
 			return nil
 		}
 		return err
@@ -119,7 +123,7 @@ func updateEmbedReason(author *discordgo.User, reason string, embed *discordgo.M
 
 	if author != nil {
 		embed.Author = &discordgo.MessageEmbedAuthor{
-			Name:    fmt.Sprintf("%s#%s (ID %d)", author.Username, author.Discriminator, author.ID),
+			Name:    fmt.Sprintf("%s (ID %d)", author.String(), author.ID),
 			IconURL: discordgo.EndpointUserAvatar(author.ID, author.Avatar),
 		}
 	}

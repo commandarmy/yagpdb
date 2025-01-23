@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/botlabs-gg/yagpdb/bot/paginatedmessages"
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/jonas747/dcmd/v4"
-	"github.com/jonas747/discordgo/v2"
+	"github.com/botlabs-gg/yagpdb/v2/bot/paginatedmessages"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/lib/dcmd"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/web"
 )
 
 var cmdHelp = &YAGCommand{
@@ -20,8 +21,7 @@ var cmdHelp = &YAGCommand{
 		{Name: "command", Type: dcmd.String},
 	},
 
-	RunFunc:  cmdFuncHelp,
-	Cooldown: 10,
+	RunFunc: cmdFuncHelp,
 }
 
 func CmdNotFound(search string) string {
@@ -43,8 +43,41 @@ func cmdFuncHelp(data *dcmd.Data) (interface{}, error) {
 			return CmdNotFound(target), nil
 		}
 
-		// Send short help in same channel
-		return resp, nil
+		// see if we can find the permissions the command needs and add that info to the help message
+		cmd, _ := data.ContainerChain[0].AbsFindCommand(target)
+		if cmd == nil {
+			return resp, nil
+		}
+
+		yc, ok := cmd.Command.(*YAGCommand)
+		if !ok {
+			return resp, nil
+		}
+
+		if len(yc.RequireDiscordPerms) == 0 && yc.RequiredDiscordPermsHelp == "" {
+			return resp, nil
+		}
+
+		requiredPerms := yc.RequiredDiscordPermsHelp
+		if requiredPerms == "" {
+			humanizedPerms := make([]string, 0, len(yc.RequireDiscordPerms))
+			for _, v := range yc.RequireDiscordPerms {
+				h := common.HumanizePermissions(v)
+				if len(h) == 1 {
+					humanizedPerms = append(humanizedPerms, h[0])
+				} else {
+					joined := strings.Join(h, " and ")
+					humanizedPerms = append(humanizedPerms, "("+joined+")")
+				}
+			}
+			requiredPerms = strings.Join(humanizedPerms, " or ")
+		}
+
+		embed := resp[0]
+		embed.Footer = &discordgo.MessageEmbedFooter{
+			Text: "Required permissions: " + requiredPerms,
+		}
+		return embed, nil
 	}
 
 	// Send full help in DM
@@ -63,17 +96,17 @@ func cmdFuncHelp(data *dcmd.Data) (interface{}, error) {
 func createInteractiveHelp(userID int64, helpEmbeds []*discordgo.MessageEmbed) (interface{}, error) {
 	channel, err := common.BotSession.UserChannelCreate(userID)
 	if err != nil {
-		return "Something went wrong, maybe you have DMs disabled? I don't want to spam this channel so here's a external link to available commands: <https://docs.yagpdb.xyz/commands>", err
+		return "Something went wrong, maybe you have DMs disabled? I don't want to spam this channel so here's a external link to available commands: <https://help.yagpdb.xyz/docs/core/all-commands/>", err
 	}
 
 	// prepend a introductionairy first page
 	firstPage := &discordgo.MessageEmbed{
 		Title: "YAGPDB Help!",
-		Description: `YAGPDB is a multipurpose discord bot that is configured through the web interface at https://yagpdb.xyz.
-For more in depth help and information you should visit https://docs.yagpdb.xyz/ as this command only shows information about commands.
+		Description: fmt.Sprintf(`YAGPDB is an open-source multipurpose discord bot that is configured through the web interface at %s.
+For more in depth help and information you should visit https://help.yagpdb.xyz/ as this command only shows information about commands.)
 		
 		
-**Use the emojis under to change pages**`,
+**Use the emojis under to change pages**`, web.BaseURL()),
 	}
 
 	var pageLayout strings.Builder
@@ -85,15 +118,8 @@ For more in depth help and information you should visit https://docs.yagpdb.xyz/
 	}
 
 	helpEmbeds = append([]*discordgo.MessageEmbed{firstPage}, helpEmbeds...)
-
-	_, err = paginatedmessages.CreatePaginatedMessage(0, channel.ID, 1, len(helpEmbeds), func(p *paginatedmessages.PaginatedMessage, page int) (*discordgo.MessageEmbed, error) {
+	return paginatedmessages.NewPaginatedResponse(0, channel.ID, 1, len(helpEmbeds), func(p *paginatedmessages.PaginatedMessage, page int) (*discordgo.MessageEmbed, error) {
 		embed := helpEmbeds[page-1]
 		return embed, nil
-	})
-	if err != nil {
-		return "Something went wrong, make sure you don't have the bot blocked!", err
-
-	}
-
-	return nil, nil
+	}), nil
 }

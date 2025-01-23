@@ -10,14 +10,14 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/botlabs-gg/yagpdb/common"
-	"github.com/botlabs-gg/yagpdb/common/cplogs"
-	"github.com/botlabs-gg/yagpdb/common/pubsub"
-	"github.com/botlabs-gg/yagpdb/reddit/models"
-	"github.com/botlabs-gg/yagpdb/web"
-	"github.com/jonas747/discordgo/v2"
-	"github.com/volatiletech/sqlboiler/boil"
-	"github.com/volatiletech/sqlboiler/queries/qm"
+	"github.com/botlabs-gg/yagpdb/v2/common"
+	"github.com/botlabs-gg/yagpdb/v2/common/cplogs"
+	"github.com/botlabs-gg/yagpdb/v2/common/pubsub"
+	"github.com/botlabs-gg/yagpdb/v2/lib/discordgo"
+	"github.com/botlabs-gg/yagpdb/v2/reddit/models"
+	"github.com/botlabs-gg/yagpdb/v2/web"
+	"github.com/volatiletech/sqlboiler/v4/boil"
+	"github.com/volatiletech/sqlboiler/v4/queries/qm"
 	"goji.io"
 	"goji.io/pat"
 )
@@ -32,21 +32,24 @@ const (
 )
 
 type CreateForm struct {
-	Subreddit  string `schema:"subreddit" valid:",1,100"`
-	Slow       bool   `schema:"slow"`
-	Channel    int64  `schema:"channel" valid:"channel,true`
-	ID         int64  `schema:"id"`
-	UseEmbeds  bool   `schema:"use_embeds"`
-	NSFWMode   int    `schema:"nsfw_filter"`
-	MinUpvotes int    `schema:"min_upvotes"`
+	Subreddit       string `schema:"subreddit" valid:",1,100"`
+	Slow            bool   `schema:"slow"`
+	Channel         int64  `schema:"channel" valid:"channel,true"`
+	ID              int64  `schema:"id"`
+	UseEmbeds       bool   `schema:"use_embeds"`
+	NSFWMode        int    `schema:"nsfw_filter"`
+	SpoilersEnabled bool   `schema:"spoilers_enabled"`
+	MinUpvotes      int    `schema:"min_upvotes" valid:"0,"`
 }
 
 type UpdateForm struct {
-	Channel    int64 `schema:"channel" valid:"channel,true`
-	ID         int64 `schema:"id"`
-	UseEmbeds  bool  `schema:"use_embeds"`
-	NSFWMode   int   `schema:"nsfw_filter"`
-	MinUpvotes int   `schema:"min_upvotes"`
+	Channel         int64 `schema:"channel" valid:"channel,true"`
+	ID              int64 `schema:"id"`
+	UseEmbeds       bool  `schema:"use_embeds"`
+	NSFWMode        int   `schema:"nsfw_filter"`
+	SpoilersEnabled bool  `schema:"spoilers_enabled"`
+	MinUpvotes      int   `schema:"min_upvotes" valid:"0,"`
+	FeedEnabled     bool  `schema:"feed_enabled"`
 }
 
 var (
@@ -133,13 +136,19 @@ func HandleNew(w http.ResponseWriter, r *http.Request) interface{} {
 		return templateData.AddAlerts(web.ErrorAlert(fmt.Sprintf("Max %d feeds allowed (or %d for premium servers)", GuildMaxFeedsNormal, GuildMaxFeedsPremium)))
 	}
 
+	subreddit := strings.TrimSpace(newElem.Subreddit)
+	subreddit = strings.ToLower(subreddit)
+	subreddit = strings.TrimPrefix(subreddit, "/")
+	subreddit = strings.TrimPrefix(subreddit, "r/")
+
 	watchItem := &models.RedditFeed{
-		GuildID:    activeGuild.ID,
-		ChannelID:  newElem.Channel,
-		Subreddit:  strings.ToLower(strings.TrimSpace(newElem.Subreddit)),
-		UseEmbeds:  newElem.UseEmbeds,
-		FilterNSFW: newElem.NSFWMode,
-		Disabled:   false,
+		GuildID:         activeGuild.ID,
+		ChannelID:       newElem.Channel,
+		Subreddit:       subreddit,
+		UseEmbeds:       newElem.UseEmbeds,
+		FilterNSFW:      newElem.NSFWMode,
+		SpoilersEnabled: newElem.SpoilersEnabled,
+		Disabled:        false,
 	}
 
 	if newElem.Slow {
@@ -147,9 +156,6 @@ func HandleNew(w http.ResponseWriter, r *http.Request) interface{} {
 		watchItem.MinUpvotes = newElem.MinUpvotes
 	}
 
-	if watchItem.ChannelID == 0 {
-		watchItem.Disabled = true
-	}
 	err := watchItem.InsertG(ctx, boil.Infer())
 	if web.CheckErr(templateData, err, "Failed saving item :'(", web.CtxLogger(ctx).Error) {
 		return templateData
@@ -165,7 +171,7 @@ func HandleNew(w http.ResponseWriter, r *http.Request) interface{} {
 
 	go cplogs.RetryAddEntry(web.NewLogEntryFromContext(r.Context(), panelLogKeyAddedFeed, &cplogs.Param{Type: cplogs.ParamTypeString, Value: watchItem.Subreddit}))
 	go pubsub.Publish("reddit_clear_subreddit_cache", -1, PubSubSubredditEventData{
-		Subreddit: strings.ToLower(strings.TrimSpace(newElem.Subreddit)),
+		Subreddit: newElem.Subreddit,
 		Slow:      newElem.Slow,
 	})
 
@@ -193,15 +199,13 @@ func HandleModify(w http.ResponseWriter, r *http.Request) interface{} {
 	item.ChannelID = updated.Channel
 	item.UseEmbeds = updated.UseEmbeds
 	item.FilterNSFW = updated.NSFWMode
-	item.Disabled = false
+	item.SpoilersEnabled = updated.SpoilersEnabled
+	item.Disabled = !updated.FeedEnabled
 	if item.Slow {
 		item.MinUpvotes = updated.MinUpvotes
 	}
 
-	if item.ChannelID == 0 {
-		item.Disabled = true
-	}
-	_, err := item.UpdateG(ctx, boil.Whitelist("channel_id", "use_embeds", "filter_nsfw", "min_upvotes", "disabled"))
+	_, err := item.UpdateG(ctx, boil.Whitelist("channel_id", "use_embeds", "filter_nsfw", "min_upvotes", "disabled", "spoilers_enabled"))
 	if web.CheckErr(templateData, err, "Failed saving item :'(", web.CtxLogger(ctx).Error) {
 		return templateData
 	}
@@ -210,7 +214,7 @@ func HandleModify(w http.ResponseWriter, r *http.Request) interface{} {
 
 	go cplogs.RetryAddEntry(web.NewLogEntryFromContext(r.Context(), panelLogKeyUpdatedFeed, &cplogs.Param{Type: cplogs.ParamTypeString, Value: item.Subreddit}))
 	go pubsub.Publish("reddit_clear_subreddit_cache", -1, PubSubSubredditEventData{
-		Subreddit: strings.ToLower(strings.TrimSpace(item.Subreddit)),
+		Subreddit: item.Subreddit,
 		Slow:      item.Slow,
 	})
 
@@ -254,7 +258,7 @@ func HandleRemove(w http.ResponseWriter, r *http.Request) interface{} {
 
 	go cplogs.RetryAddEntry(web.NewLogEntryFromContext(r.Context(), panelLogKeyRemovedFeed, &cplogs.Param{Type: cplogs.ParamTypeString, Value: item.Subreddit}))
 	go pubsub.Publish("reddit_clear_subreddit_cache", -1, PubSubSubredditEventData{
-		Subreddit: strings.ToLower(strings.TrimSpace(item.Subreddit)),
+		Subreddit: item.Subreddit,
 		Slow:      item.Slow,
 	})
 
@@ -279,7 +283,7 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 	templateData["WidgetTitle"] = "Reddit feeds"
 	templateData["SettingsPath"] = "/reddit"
 
-	rows, err := models.RedditFeeds(qm.Where("guild_id = ?", ag.ID), qm.GroupBy("slow"), qm.OrderBy("slow asc"), qm.Select("count(*)")).QueryContext(r.Context(), common.PQ)
+	rows, err := models.RedditFeeds(qm.Where("guild_id = ?", ag.ID), qm.GroupBy("slow"), qm.OrderBy("slow asc"), qm.Select("count(*), slow")).QueryContext(r.Context(), common.PQ)
 	if err != nil {
 		return templateData, err
 	}
@@ -287,18 +291,19 @@ func (p *Plugin) LoadServerHomeWidget(w http.ResponseWriter, r *http.Request) (w
 
 	var slow int
 	var fast int
+	var isSlow bool
 
-	i := 0
 	for rows.Next() {
 		var err error
-		if i == 0 {
-			err = rows.Scan(&fast)
-		} else {
-			err = rows.Scan(&slow)
-		}
-		i++
+		var val int
+		err = rows.Scan(&val, &isSlow)
 		if err != nil {
 			return templateData, err
+		}
+		if isSlow {
+			slow = val
+		} else {
+			fast = val
 		}
 	}
 
